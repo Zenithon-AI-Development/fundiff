@@ -2,8 +2,16 @@ from absl import app
 from absl import flags
 from ml_collections import config_flags
 
+import os
+import sys
+
 import jax
 jax.config.update("jax_default_matmul_precision", "highest")
+
+# Ensure project root is on PYTHONPATH so `burgers` and `function_diffusion` are importable
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import train_autoencoder
 import train_diffusion

@@ -36,12 +36,16 @@ def get_base_config():
 
     # Weights & Biases
     config.wandb = wandb = ml_collections.ConfigDict()
-    wandb.project = "fundiff_burgers"
+    wandb.project = "fundiff_burgers_example"
+    wandb.entity = "Zenithon-AI" # Set to your W&B entity (e.g. "guzmans") if needed
+    wandb.run_name = None  # Optional explicit run name; falls back to job_name if None
     wandb.tag = None
 
     # Dataset
     config.dataset = dataset = ml_collections.ConfigDict()
-    dataset.data_path = "/scratch/sifanw/transformer_as_integrator/burgers/burger_nu_1e-3.mat"
+    # Path is relative to the training script working directory (`burgers/diffusion`).
+    # Expect the dataset at `burgers/data/burger_nu_1e-3.mat` inside the repo.
+    dataset.data_path = "../data/burger_nu_1e-3.mat"
     dataset.downsample_factor = 1
     dataset.batch_size = 128  # Per device
     dataset.num_train_samples = 3600

@@ -1,0 +1,36 @@
+name: fundiff-burgers-l4
+
+resources:
+  cloud: gcp
+  region: us-central1
+  accelerators: L4:1
+  cpus: 8+
+  disk_size: 200
+  use_spot: false
+
+# W&B (recommended):
+
+# envs:
+#     WANDB_API_KEY: "<your-key>"
+
+
+# One-time setup per node (idempotent): create venv, install deps + JAX(CUDA), and install this repo.
+setup: |
+  cd /sky_workdir
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install --upgrade pip
+  if [ ! -f .venv/.fundiff_deps_installed ]; then
+    pip install -r requirements.txt
+    pip install -e .
+    pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+    touch .venv/.fundiff_deps_installed
+  fi
+
+# Command to run on the node: Burgers autoencoder smoke test.
+run: |
+  cd /sky_workdir
+  source .venv/bin/activate
+  test -f burgers/data/burger_nu_1e-3.mat
+  cd burgers/diffusion
+  python main.py --config=configs/autoencoder.py:fae --config.training.use_pde=True

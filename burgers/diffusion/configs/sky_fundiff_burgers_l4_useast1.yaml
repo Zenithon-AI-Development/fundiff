@@ -1,0 +1,39 @@
+name: fundiff-burgers-l4-useast1
+
+resources:
+  cloud: gcp
+  region: us-east1
+  accelerators: L4:1
+  cpus: 8+
+  disk_size: 200
+  use_spot: false
+
+# Workdir defaults to the directory you run `sky launch` from.
+# Launch from `/home/guzmans/fundiff` so the repo (and `burgers/data/...`) are synced to `/sky_workdir`.
+
+# Optional: set WANDB_API_KEY here to enable non-interactive W&B logging.
+# envs:
+#   WANDB_API_KEY: "<paste-your-key-here>"
+
+# One-time setup per node (idempotent): create venv, install deps + JAX(CUDA), and install this repo.
+setup: |
+  cd /sky_workdir
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install --upgrade pip
+  if [ ! -f .venv/.fundiff_deps_installed ]; then
+    pip install -r requirements.txt
+    pip install -e .
+    pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+    touch .venv/.fundiff_deps_installed
+  fi
+
+# Command to run on the node: Burgers autoencoder smoke test.
+run: |
+  cd /sky_workdir
+  source .venv/bin/activate
+  test -f burgers/data/burger_nu_1e-3.mat
+  cd burgers/diffusion
+  python main.py --config=configs/autoencoder.py:fae --config.training.use_pde=True
+
+

@@ -27,12 +27,16 @@ def get_base_config():
 
     # Weights & Biases
     config.wandb = wandb = ml_collections.ConfigDict()
-    wandb.project = "fundiff_burgers"
+    wandb.project = "fundiff_burgers_example"
+    wandb.entity = "Zenithon-AI"  # Set to your W&B entity (e.g. "guzmans") if needed
+    wandb.run_name = None  # Optional explicit run name; falls back to job_name if None
     wandb.tag = None
 
     # Dataset
     config.dataset = dataset = ml_collections.ConfigDict()
-    dataset.data_path = "/scratch/sifanw/transformer_as_integrator/burgers/burger_nu_1e-3.mat"
+    # Path is relative to the training script working directory (`burgers/diffusion`).
+    # Expect the dataset at `burgers/data/burger_nu_1e-3.mat` inside the repo.
+    dataset.data_path = "../data/burger_nu_1e-3.mat"
     dataset.downsample_factor = 1
     dataset.num_train_samples = 3600
     dataset.train_batch_size = 16  # Per device
@@ -57,7 +61,10 @@ def get_base_config():
 
     # Training
     config.training = training = ml_collections.ConfigDict()
-    training.max_steps = 1 * 10**5
+    # Number of gradient steps; ~225 steps ≈ 1 epoch for the default Burgers dataset,
+    # so 1_000 steps is roughly 4–5 epochs for a quick smoke test.
+    # training.max_steps = 1 * 10**5  previous setup
+    training.max_steps = 1_000
     training.num_queries = 4096
     training.random_resolution = True
     training.use_pde = False

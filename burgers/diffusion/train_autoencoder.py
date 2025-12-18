@@ -79,7 +79,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
 
         # Initialize W&B
         wandb_config = config.wandb
-        wandb.init(project=wandb_config.project, name=job_name, config=config)
+        run_name = getattr(wandb_config, "run_name", None) or job_name
+        wandb.init(
+            project=wandb_config.project,
+            entity=getattr(wandb_config, "entity", None),
+            name=run_name,
+            config=config,
+        )
 
     # Create checkpoint manager
     ckpt_mngr = create_checkpoint_manager(config.saving, ckpt_path)
