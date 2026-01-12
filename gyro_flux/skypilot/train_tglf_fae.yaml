@@ -1,0 +1,54 @@
+name: tglf-fae-training
+
+resources:
+  cpus: 4+
+  accelerators: L4:1
+  region: us-central1
+  use_spot: true
+
+file_mounts:
+  # Training data from GCS (COPY because it's a subfolder)
+  /data:
+    source: gs://zen_ml_data/gyro_flux/Well_Formatted_CGYRO_W_TGLF
+    mode: COPY
+  
+  # Checkpoints - mount entire bucket
+  /checkpoints:
+    source: gs://zen_ml_checkpoints
+    mode: MOUNT
+
+setup: |
+  echo "=== Setting up environment ==="
+  
+  # Create and activate virtual environment
+  python3 -m venv ~/venv
+  source ~/venv/bin/activate
+  
+  # Install dependencies
+  pip install -q --upgrade pip
+  pip install -q \
+    absl-py \
+    einops \
+    h5py \
+    flax \
+    "jax[cuda12]" \
+    ml_collections \
+    numpy \
+    optax \
+    orbax-checkpoint \
+    torch \
+    wandb
+  
+  echo "=== Setup complete ==="
+
+run: |
+  source ~/venv/bin/activate
+  cd ~/code
+  
+  echo "=== Starting TGLF FAE training ==="
+  echo "Data path: /data"
+  echo "Checkpoint path: /checkpoints"
+  
+  python -m gyro_flux.diffusion.train_tglf_fae \
+    --data_path=/data \
+    --workdir=/checkpoints/TGLF_FAE/run1
