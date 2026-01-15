@@ -32,20 +32,22 @@ def get_base_config():
     wandb.project = "gyro_flux"
     wandb.entity = "Zenithon-AI"
     wandb.group = "target_fae"
-    wandb.run_name = "target-fae-test4_time"
+    wandb.run_name = "target-fae-patch1_nopad_disable_combuff"  # No padding test with patch_size=1
+    wandb.notes = "Testing patch_size=1 with variable-length sequences (no padding). \
+                    Checking if padding was the main cause of loss not continuing to decrease."
     wandb.tag = None
 
     # Dataset
     config.dataset = dataset = ml_collections.ConfigDict()
-    dataset.data_path = "/home/shared_info/Well_Formatted_CGYRO_W_TGLF/"
+    dataset.data_path = "/home/shared_info/Well_Formatted_CGYRO_W_TGLF_structured/2species_2fields/"
     dataset.num_train_samples = None     # Number of training samples (None = all)
-    dataset.train_batch_size = 16         # 1 for variable-length, can increase for padded
+    dataset.train_batch_size = 1         # MUST be 1 for variable-length (no padding)
     dataset.test_batch_size = 1
     dataset.num_workers = 4
     
     # Padding options for efficient compilation
-    dataset.use_padded_sequences = True  # If True, pad all sequences to max_seq_length
-    dataset.max_seq_length = 3000         # Max sequence length for padding
+    dataset.use_padded_sequences = False  # False = true variable-length, True = padded to max_seq_length
+    dataset.max_seq_length = 3000         # Only used if use_padded_sequences=True
 
     # Learning rate schedule
     config.lr = lr = ml_collections.ConfigDict()

@@ -13,6 +13,10 @@ import os
 import json
 import time
 
+# Disable command buffers to avoid OOM with variable-length sequences
+# Each unique sequence length triggers a new JAX compilation, creating many CUDA graphs
+os.environ.setdefault('XLA_FLAGS', '--xla_gpu_enable_command_buffer=')
+
 import ml_collections
 from absl import app, flags
 import wandb
@@ -213,6 +217,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
                 entity=getattr(wandb_config, "entity", None),
                 group=getattr(wandb_config, "group", None),
                 name=run_name,
+                notes=getattr(wandb_config, "notes", None),  # Description shown in W&B UI
+                tags=getattr(wandb_config, "tag", None).split(',') if getattr(wandb_config, "tag", None) else None,
                 config=config.to_dict(),
             )
             wandb.log({"num_params": num_params}, step=0)

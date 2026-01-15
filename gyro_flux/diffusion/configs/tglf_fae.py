@@ -37,13 +37,14 @@ def get_base_config():
     wandb.entity = "Zenithon-AI"
     wandb.group = "tglf_fae"
     wandb.run_name = "tglf-fae-test2"
+    wandb.notes = None  # Optional: Description shown in W&B UI
     wandb.tag = None
 
     # Dataset
     config.dataset = dataset = ml_collections.ConfigDict()
-    dataset.data_path = "/home/shared_info/Well_Formatted_CGYRO_W_TGLF/"
+    dataset.data_path = "/home/shared_info/Well_Formatted_CGYRO_W_TGLF_structured/2species_2fields/"
     dataset.num_train_samples = None     # Number of training samples (None = all)
-    dataset.train_batch_size = 32        # ~5 batches/epoch with 154 samples
+    dataset.train_batch_size = 32        # ~8 batches/epoch with ~253 samples
     dataset.test_batch_size = 32
     dataset.num_workers = 4
 
@@ -53,7 +54,7 @@ def get_base_config():
     lr.peak_value = 3e-4                 # Conservative for small dataset
     lr.decay_rate = 0.1                  # Decay to 10% of peak
     lr.transition_steps = 10000          # Decay over this many steps
-    lr.warmup_steps = 500                # ~100 epochs warmup
+    lr.warmup_steps = 500                # ~62 epochs warmup (253/32 ≈ 8 batches/epoch)
 
     # Optimizer (AdamW)
     config.optim = optim = ml_collections.ConfigDict()
@@ -65,16 +66,16 @@ def get_base_config():
 
     # Training
     config.training = training = ml_collections.ConfigDict()
-    training.max_steps = 10_000          # ~2000 epochs (154/32 ≈ 5 batches/epoch)
+    training.max_steps = 10_000          # ~1250 epochs (253/32 ≈ 8 batches/epoch)
     training.num_queries = 21            # Reconstruct ALL 21 ky modes each step
 
     # Logging
     config.logging = logging = ml_collections.ConfigDict()
-    logging.log_interval = 100           # Every 100 steps (~20 epochs)
+    logging.log_interval = 100           # Every 100 steps (~12-13 epochs)
 
     # Saving
     config.saving = saving = ml_collections.ConfigDict()
-    saving.save_interval = 1000          # Every 1000 steps (~200 epochs)
+    saving.save_interval = 1000          # Every 1000 steps (~125 epochs)
     saving.num_keep_ckpts = 5
 
     return config

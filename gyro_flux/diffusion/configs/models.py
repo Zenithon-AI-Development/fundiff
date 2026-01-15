@@ -27,9 +27,9 @@ def get_target_fae_config():
     # Encoder: (B, T, 2) -> (B, num_latents, emb_dim), T varies
     config.encoder = encoder = ml_collections.ConfigDict()
     encoder.in_channels = 2              # Q_i, Q_e
-    encoder.patch_size = 5               # Group 5 timesteps per patch
+    encoder.patch_size = 1               # No patching - preserve full resolution (was 5)
     encoder.emb_dim = 256                # Embedding dimension
-    encoder.max_patches = 600            # Max T=3000 / patch_size=5 for PE interpolation
+    encoder.max_patches = 3500           # Max T=3500
     encoder.num_latents = 64             # Latent sequence length after Perceiver
     encoder.perceiver_depth = 2          # Cross-attn layers in Perceiver bottleneck
     encoder.transformer_depth = 6        # Self-attn layers after bottleneck

@@ -1,0 +1,26 @@
+name: target-fae-test
+
+resources:
+  accelerators: A100:1  # Fast GPU for training
+  use_spot: false  # Try without spot first to test availability
+  region: us-central1
+  memory: 32+  # Request at least 32GB RAM
+
+file_mounts:
+  # Training data from GCS (COPY because it's a subfolder)
+  /data:
+    source: gs://data-share-bucket-zenithon/Well_Formatted_CGYRO_W_TGLF_structured/2species_2fields
+    mode: COPY
+  
+  # Checkpoints - mount entire bucket
+  /checkpoints:
+    source: gs://zen_ml_checkpoints
+    mode: MOUNT
+
+setup: |
+  echo "=== Setting up environment ==="
+  python3 -m venv ~/venv
+  source ~/venv/bin/activate
+  pip install -q --upgrade pip
+  pip install -q absl-py einops h5py flax "jax[cuda12]" ml_collections numpy optax orbax-checkpoint torch tqdm wandb
+  echo "=== Setup complete ==="

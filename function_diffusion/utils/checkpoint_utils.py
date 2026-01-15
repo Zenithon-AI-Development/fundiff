@@ -27,7 +27,7 @@ def restore_checkpoint(ckpt_mngr, state):
     state = ckpt_mngr.restore(
         ckpt_mngr.latest_step(),
         args=ocp.args.StandardRestore(state),
-    )
+        )
     return state
 
 

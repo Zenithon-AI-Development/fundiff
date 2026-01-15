@@ -181,6 +181,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
                 entity=getattr(wandb_config, "entity", None),
                 group=getattr(wandb_config, "group", None),
                 name=run_name,
+                notes=getattr(wandb_config, "notes", None),  # Description shown in W&B UI
+                tags=getattr(wandb_config, "tag", None).split(',') if getattr(wandb_config, "tag", None) else None,
                 config=config.to_dict(),
             )
             wandb.log({"num_params": num_params}, step=0)

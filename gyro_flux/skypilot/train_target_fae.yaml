@@ -1,0 +1,56 @@
+name: target-fae-training
+
+resources:
+  accelerators: A100:1  # Use A100 for faster training (or H100:1 for even faster)
+  use_spot: true
+  region: us-central1
+  memory: 32+  # Request at least 32GB RAM
+
+file_mounts:
+  # Training data from GCS
+  /data:
+    source: gs://zen_ml_data/gyro_flux/Well_Formatted_CGYRO_W_TGLF
+    mode: COPY
+  
+  # Checkpoints - mount entire bucket
+  /checkpoints:
+    source: gs://zen_ml_checkpoints
+    mode: MOUNT
+
+setup: |
+  echo "=== Setting up environment ==="
+  
+  # Create and activate virtual environment
+  python3 -m venv ~/venv
+  source ~/venv/bin/activate
+  
+  # Install dependencies
+  pip install -q --upgrade pip
+  pip install -q \
+    absl-py \
+    einops \
+    h5py \
+    flax \
+    "jax[cuda12]" \
+    ml_collections \
+    numpy \
+    optax \
+    orbax-checkpoint \
+    torch \
+    tqdm \
+    wandb
+  
+  echo "=== Setup complete ==="
+
+run: |
+  source ~/venv/bin/activate
+  cd ~/code
+  
+  echo "=== Starting Target FAE training ==="
+  echo "Data path: /data"
+  echo "Checkpoint path: /checkpoints"
+  
+  python -m gyro_flux.diffusion.train_target_fae \
+    --config=gyro_flux/diffusion/configs/target_fae.py \
+    --data_path=/data \
+    --workdir=/checkpoints/gyro_flux/TARGET_FAE/patch_size_1_test

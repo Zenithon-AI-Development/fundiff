@@ -58,6 +58,11 @@ def load_tglf_sample(npz_path: Path) -> np.ndarray:
 def get_paired_folders(base_path: str) -> List[Path]:
     """Get folders that have both TGLF (conditioning_data.npz) and CGYRO (.h5).
     
+    For the new structured layout, base_path should point to:
+    /home/shared_info/Well_Formatted_CGYRO_W_TGLF_structured/2species_2fields
+    
+    All folders in 2species_2fields are guaranteed to have both TGLF and CGYRO data.
+    
     Args:
         base_path: Path to the data directory containing run folders
     
@@ -71,17 +76,25 @@ def get_paired_folders(base_path: str) -> List[Path]:
         if not folder.is_dir():
             continue
         
+        # In the new structure, all folders should have both files
+        # But we still verify to be safe
         has_tglf = (folder / "conditioning_data.npz").exists()
         has_cgyro = any(folder.glob("*.h5"))
         
         if has_tglf and has_cgyro:
             paired.append(folder)
+        elif not has_tglf or not has_cgyro:
+            # Warn if we find a folder without both (shouldn't happen in 2species_2fields)
+            print(f"Warning: {folder.name} missing {'TGLF' if not has_tglf else 'CGYRO'} data")
     
     return paired
 
 
 def get_tglf_only_folders(base_path: str) -> List[Path]:
     """Get all folders that have TGLF conditioning data.
+    
+    For the new structured layout, base_path should point to:
+    /home/shared_info/Well_Formatted_CGYRO_W_TGLF_structured/2species_2fields
     
     Args:
         base_path: Path to the data directory
@@ -107,9 +120,14 @@ class TGLFDataset(Dataset):
     
     Each sample is a (21, 108) array of TGLF features.
     
+    For the new structured layout, data_path should point to:
+    /home/shared_info/Well_Formatted_CGYRO_W_TGLF_structured/2species_2fields
+    
+    All folders in 2species_2fields are guaranteed to have both TGLF and CGYRO data.
+    
     Args:
-        data_path: Path to directory containing run folders
-        paired_only: If True, only include folders with both TGLF and CGYRO
+        data_path: Path to directory containing run folders (should be 2species_2fields)
+        paired_only: If True, only include folders with both TGLF and CGYRO (default True)
         normalize: If True, apply z-score normalization per feature
         stats: Optional (mean, std) tuple for normalization. If None, computed from data.
     """
@@ -293,8 +311,13 @@ class CGYRODataset(Dataset):
     Each sample is a (n_timesteps, 2) array of energy flux.
     Note: n_timesteps varies per sample (typically 150-3000).
     
+    For the new structured layout, data_path should point to:
+    /home/shared_info/Well_Formatted_CGYRO_W_TGLF_structured/2species_2fields
+    
+    All folders in 2species_2fields are guaranteed to have both TGLF and CGYRO data.
+    
     Args:
-        data_path: Path to directory containing run folders
+        data_path: Path to directory containing run folders (should be 2species_2fields)
         normalize: If True, apply normalization
         stats: Optional (mean, std) for normalization
         use_padding: If True, pad all sequences to max_seq_length for efficient JAX compilation
@@ -488,8 +511,14 @@ class PairedDataset(Dataset):
     Used for diffusion training where we need both conditioning (TGLF)
     and target (CGYRO) data.
     
+    For the new structured layout, data_path should point to:
+    /home/shared_info/Well_Formatted_CGYRO_W_TGLF_structured/2species_2fields
+    
+    All folders in 2species_2fields are guaranteed to have both TGLF and CGYRO data.
+    The dataset now contains ~253 folders (increased from ~154).
+    
     Args:
-        data_path: Path to directory containing run folders
+        data_path: Path to directory containing run folders (should be 2species_2fields)
         normalize_tglf: Whether to normalize TGLF data
         normalize_cgyro: Whether to normalize CGYRO data
     """
