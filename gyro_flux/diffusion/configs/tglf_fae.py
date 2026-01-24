@@ -32,12 +32,12 @@ def get_base_config():
 
     # Weights & Biases
     config.wandb = wandb = ml_collections.ConfigDict()
-    wandb.use_wandb = False              # Set True to enable W&B logging
+    wandb.use_wandb = True               # Set True to enable W&B logging
     wandb.project = "gyro_flux"
     wandb.entity = "Zenithon-AI"
-    wandb.group = "tglf_fae"
-    wandb.run_name = "tglf-fae-test2"
-    wandb.notes = None  # Optional: Description shown in W&B UI
+    wandb.group = "week19jan"
+    wandb.run_name = "tglf-fae-v2-small"
+    wandb.notes = "v2-small: Reduced model (emb=128, latents=8, depth=2) to prevent overfitting on ~180 samples."
     wandb.tag = None
 
     # Dataset

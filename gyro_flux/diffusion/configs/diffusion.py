@@ -1,6 +1,6 @@
 import ml_collections
 
-from configs import models
+from gyro_flux.diffusion.configs import models
 
 
 def get_config(model_pair="target_fae,flux_dit"):
@@ -45,9 +45,12 @@ def get_base_config():
 
     # Weights & Biases
     config.wandb = wandb = ml_collections.ConfigDict()
+    wandb.use_wandb = True              # Set True to enable W&B logging
     wandb.project = "gyro_flux"
-    wandb.entity = None
-    wandb.run_name = None
+    wandb.entity = "Zenithon-AI"
+    wandb.group = "flux_dit"
+    wandb.run_name = "flux-dit-default"
+    wandb.notes = None  # Optional: Description shown in W&B UI
     wandb.tag = None
 
     # Dataset

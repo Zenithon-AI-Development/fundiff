@@ -24,12 +24,15 @@ from jax.sharding import Mesh, PartitionSpec as P
 from flax.training import train_state
 
 import optax
+import numpy as np
+from sklearn.model_selection import train_test_split
 
 from gyro_flux.models import TGLFEncoder, TGLFDecoder
-from gyro_flux.data_utils import TGLFDataset, create_tglf_dataloader
+from gyro_flux.data_utils import TGLFDataset, create_tglf_dataloader, get_paired_folders
 from gyro_flux.diffusion.model_utils import (
     create_tglf_train_step,
     prepare_tglf_batch,
+    tglf_loss_fn,
 )
 
 from function_diffusion.utils.checkpoint_utils import (
@@ -135,18 +138,54 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
     # Create train step function
     train_step = create_tglf_train_step(encoder, decoder, mesh)
 
-    # Create dataset and dataloader
+    # Create dataset split (80/10/10: train/val/test)
+    all_folders = get_paired_folders(config.dataset.data_path)
+    print(f"Total folders found: {len(all_folders)}")
+
+    # First split: 80% train, 20% temp (for val + test)
+    train_folders, temp_folders = train_test_split(
+        all_folders, test_size=0.2, random_state=config.seed
+    )
+
+    # Second split: 50% of temp = 10% of total for val, 10% for test
+    val_folders, test_folders = train_test_split(
+        temp_folders, test_size=0.5, random_state=config.seed
+    )
+
+    print(f"Train: {len(train_folders)} samples ({100*len(train_folders)/len(all_folders):.1f}%)")
+    print(f"Val: {len(val_folders)} samples ({100*len(val_folders)/len(all_folders):.1f}%)")
+    print(f"Test: {len(test_folders)} samples ({100*len(test_folders)/len(all_folders):.1f}%)")
+
+    # Create train dataset
     train_dataset = TGLFDataset(
         data_path=config.dataset.data_path,
-        paired_only=True,  # Only use samples with CGYRO data
-        normalize=False,   # Could enable normalization if needed
+        paired_only=True,
+        normalize=False,
+        folder_list=train_folders,
     )
+
+    # Create val dataset
+    val_dataset = TGLFDataset(
+        data_path=config.dataset.data_path,
+        paired_only=True,
+        normalize=False,
+        folder_list=val_folders,
+    )
+
     train_loader = create_tglf_dataloader(
         train_dataset,
         batch_size=config.dataset.train_batch_size,
         num_workers=config.dataset.num_workers,
         shuffle=True,
         drop_last=True,
+    )
+
+    val_loader = create_tglf_dataloader(
+        val_dataset,
+        batch_size=config.dataset.test_batch_size,
+        num_workers=config.dataset.num_workers,
+        shuffle=False,
+        drop_last=False,
     )
 
     # Working directory for checkpoints
@@ -194,40 +233,43 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
     rng_key = jax.random.PRNGKey(config.seed)
     step = 0
     num_queries = config.training.num_queries
-    
+
     print(f"Starting training for {config.training.max_steps} steps...")
-    print(f"Dataset size: {len(train_dataset)} samples")
+    print(f"Train dataset size: {len(train_dataset)} samples")
+    print(f"Val dataset size: {len(val_dataset)} samples")
     print(f"Batch size: {config.dataset.train_batch_size * num_devices}")
     
     epoch = 0
+    train_loss_val = 0.0  # Track last training loss for epoch summary
     while step < config.training.max_steps:
         epoch += 1
         start_time = time.time()
-        
+
         for batch_data in train_loader:
             if step >= config.training.max_steps:
                 break
-            
+
             rng_key, subkey = jax.random.split(rng_key)
-            
+
             # Convert to JAX arrays
             tglf = jnp.array(batch_data)  # (B, 21, 108)
-            
+
             # Prepare batch with random query sampling
             batch = prepare_tglf_batch(tglf, num_queries, subkey)
-            
+
             # Shard batch across devices
             batch = multihost_utils.host_local_array_to_global_array(
                 batch, mesh, P("batch")
             )
-            
+
             # Train step
             state, loss, loss_recon = train_step(state, batch)
             step = int(state.step)
-            
+            train_loss_val = loss.item()  # Track for epoch summary
+
             # Logging
             if step % config.logging.log_interval == 0:
-                loss_val = loss.item()
+                loss_val = train_loss_val
                 loss_recon_val = loss_recon.item()
                 current_lr = lr(step)
                 
@@ -236,8 +278,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
                     
                     if use_wandb:
                         log_dict = {
-                            "loss": loss_val,
-                            "loss_recon": loss_recon_val,
+                            "loss/train": loss_val,
+                            "loss_recon/train": loss_recon_val,
                             "lr": current_lr,
                             "epoch": epoch,
                         }
@@ -246,10 +288,53 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             # Save checkpoint
             if step % config.saving.save_interval == 0:
                 save_checkpoint(ckpt_mngr, state)
-        
+
+        # Validation at end of each epoch
+        if jax.process_index() == 0:
+            print(f"Epoch {epoch} completed, running validation...")
+
+        val_loss_sum = 0.0
+        val_loss_recon_sum = 0.0
+        val_batches = 0
+        val_rng_key = jax.random.PRNGKey(config.seed + epoch)
+
+        for val_batch_data in val_loader:
+            val_rng_key, val_subkey = jax.random.split(val_rng_key)
+
+            tglf_val = jnp.array(val_batch_data)  # (B, 21, 108)
+
+            # Prepare batch with random query sampling
+            val_batch = prepare_tglf_batch(tglf_val, num_queries, val_subkey)
+
+            # Shard batch across devices
+            val_batch = multihost_utils.host_local_array_to_global_array(
+                val_batch, mesh, P("batch")
+            )
+
+            # Compute validation loss (no gradients)
+            val_loss, val_metrics = tglf_loss_fn(
+                encoder, decoder, state.params, val_batch
+            )
+
+            val_loss_sum += val_loss.item()
+            val_loss_recon_sum += val_metrics['loss_recon'].item()
+            val_batches += 1
+
+        # Average validation metrics
+        avg_val_loss = val_loss_sum / val_batches if val_batches > 0 else 0.0
+        avg_val_loss_recon = val_loss_recon_sum / val_batches if val_batches > 0 else 0.0
+
         end_time = time.time()
         if jax.process_index() == 0:
             print(f"Epoch {epoch} completed in {end_time - start_time:.2f}s")
+            print(f"  Train loss: {train_loss_val:.3e}, Val loss: {avg_val_loss:.3e}")
+
+            if use_wandb:
+                wandb.log({
+                    "loss/val": avg_val_loss,
+                    "loss_recon/val": avg_val_loss_recon,
+                    "epoch": epoch,
+                }, step=step)
 
     # Save final checkpoint
     print("Training finished, saving final checkpoint...")

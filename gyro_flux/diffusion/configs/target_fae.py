@@ -19,9 +19,10 @@ def get_base_config():
     config.seed = 42
 
     # Input shape for initializing Flax models (dummy batch size for param init)
-    # Target FAE: (B, T, C) where T varies ~150-3000, using 1000 as example
-    config.x_dim = [2, 1000, 2]          # [dummy_batch=2, example_timesteps, channels]
-    config.step_query_dim = [2, 256]     # [dummy_batch=2, num_queries] integer step indices
+    # Target FAE: (B, T, C) where T=256 after slicing
+    config.x_dim = [2, 256, 2]           # [dummy_batch=2, slice_length, channels] flux input
+    config.t_dim = [2, 256, 1]           # [dummy_batch=2, slice_length, 1] normalized time coordinates
+    config.t_query_dim = [2, 64, 1]      # [dummy_batch=2, num_queries, 1] normalized time queries
 
     # Training or evaluation
     config.mode = "train_target_fae"
@@ -29,32 +30,45 @@ def get_base_config():
     # Weights & Biases
     config.wandb = wandb = ml_collections.ConfigDict()
     wandb.use_wandb = True              # Set True to enable W&B logging
-    wandb.project = "gyro_flux"
+    wandb.project = "gyro_flux_target_training"
     wandb.entity = "Zenithon-AI"
-    wandb.group = "target_fae"
-    wandb.run_name = "target-fae-patch1_nopad_disable_combuff"  # No padding test with patch_size=1
-    wandb.notes = "Testing patch_size=1 with variable-length sequences (no padding). \
-                    Checking if padding was the main cause of loss not continuing to decrease."
+    wandb.group = "week19jan"
+    wandb.run_name = "target-fae-v3-diagnostic"  # Diagnostic run
+    wandb.notes = "v3 diagnostic: Logging padding_ratio and query distribution to identify bimodal loss cause. Same model as v3-timeslice."
     wandb.tag = None
 
     # Dataset
     config.dataset = dataset = ml_collections.ConfigDict()
     dataset.data_path = "/home/shared_info/Well_Formatted_CGYRO_W_TGLF_structured/2species_2fields/"
     dataset.num_train_samples = None     # Number of training samples (None = all)
-    dataset.train_batch_size = 1         # MUST be 1 for variable-length (no padding)
-    dataset.test_batch_size = 1
+    dataset.train_batch_size = 32        # Increased for more stable gradients
+    dataset.test_batch_size = 32
     dataset.num_workers = 4
-    
+
     # Padding options for efficient compilation
-    dataset.use_padded_sequences = False  # False = true variable-length, True = padded to max_seq_length
-    dataset.max_seq_length = 3000         # Only used if use_padded_sequences=True
+    dataset.use_padded_sequences = True   # Required for time-based slicing (variable lengths after slicing)
+    dataset.max_seq_length = 3000         # Fallback max length (overridden by time-based slicing)
+
+    # Slice strategy: use time-based slicing for consistent physics coverage
+    # OLD (deprecated): slice_some_time slices by array index - inconsistent across different dt
+    dataset.slice_some_time = False      # Deprecated: slices by index, not physical time
+    dataset.slice_length = 256           # Fallback if using index-based slicing
+
+    # NEW: Time-based slicing ensures consistent physical time coverage across all samples
+    # τ = (t - 3.0) / 1000.0, so max_tau=0.1 means t ∈ [3.0, 103.0] (100 time units)
+    dataset.slice_by_time = True         # Use physical time instead of array indices
+    dataset.max_tau = 0.1                # Max normalized time to include (100 time units of physics)
+
+    # Normalization: addresses 324x magnitude variation across files
+    dataset.normalize_per_sample = True   # Normalize each sample to zero mean, unit std (recommended)
+    dataset.normalize_global = False      # Global z-score normalization (alternative)
 
     # Learning rate schedule
     config.lr = lr = ml_collections.ConfigDict()
     lr.init_value = 0.0
     lr.peak_value = 3e-4
     lr.decay_rate = 0.9
-    lr.transition_steps = 20000
+    lr.transition_steps = 30000          # Match max_steps for proper decay schedule
     lr.warmup_steps = 1000
 
     # Optimizer (AdamW)
@@ -67,14 +81,20 @@ def get_base_config():
 
     # Training
     config.training = training = ml_collections.ConfigDict()
-    training.max_steps = 20000
-    training.num_queries = 256           # Number of random time points to sample per batch
-    training.use_time_weighting = True  # Weight early timesteps (growth phase) more
-    training.growth_phase_weight = 5.0   # Weight multiplier for t < 0.02 (~24 steps)
+    training.max_steps = 30000           # Extended training for better convergence
+    training.num_queries = 64            # Number of random time points to sample per batch (reduced for smaller model)
+    training.use_time_weighting = False  # Weight early timesteps (growth phase) more
+    training.growth_phase_weight = 5.0
+
+    # Loss function: relative L2 for scale-invariance
+    # NOTE: Disabled - redundant with per-sample normalization. After per-sample norm,
+    # all samples have similar target² values, so rel L2 weights become constant (~0.5)
+    training.use_relative_l2 = False     # Disabled (redundant with per-sample normalization)
+    training.rel_l2_eps = 1.0            # Epsilon for denominator stability (unused when disabled)   
 
     # Logging
     config.logging = logging = ml_collections.ConfigDict()
-    logging.log_interval = 50
+    logging.log_interval = 10  # Frequent logging for diagnostic correlation analysis
 
     # Saving
     config.saving = saving = ml_collections.ConfigDict()
