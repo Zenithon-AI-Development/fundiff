@@ -43,7 +43,7 @@ def get_target_fae_config():
     encoder.fourier_freq = 150.0         # Must match decoder - Fourier frequency for time embedding
     
     # Physics conditioning (NEW)
-    encoder.use_physics_conditioning = True   # ENABLED: Test with global norm
+    encoder.use_physics_conditioning = False   # ENABLED: Test with global norm
     encoder.num_physics_params = 5            # Number of physics parameters (DLNTDR, DLNNDR, KY, NU_EE, MASS)
 
     # Decoder: (B, num_latents, emb_dim) + t_query -> (B, N_queries, 2)
