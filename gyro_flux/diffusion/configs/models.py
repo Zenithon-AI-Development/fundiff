@@ -34,13 +34,17 @@ def get_target_fae_config():
     config.encoder = encoder = ml_collections.ConfigDict()
     encoder.in_channels = 2              # Q_i, Q_e
     encoder.emb_dim = 128                # Reduced: 256 -> 128 (smaller model for limited data)
-    encoder.num_latents = 32             # Reduced: 128 -> 32 (8:1 compression from 256 timesteps)
+    encoder.num_latents = 64             
     encoder.perceiver_depth = 2          # Cross-attn layers in Perceiver bottleneck
-    encoder.transformer_depth = 4        # Reduced: 8 -> 4 (prevent overfitting)
+    encoder.transformer_depth = 6        # Reduced: 8 -> 4 (prevent overfitting)
     encoder.num_heads = 4                # Reduced: 8 -> 4 (proportional to emb_dim)
     encoder.mlp_ratio = 2
     encoder.layer_norm_eps = 1e-5
     encoder.fourier_freq = 150.0         # Must match decoder - Fourier frequency for time embedding
+    
+    # Physics conditioning (NEW)
+    encoder.use_physics_conditioning = True   # ENABLED: Test with global norm
+    encoder.num_physics_params = 5            # Number of physics parameters (DLNTDR, DLNNDR, KY, NU_EE, MASS)
 
     # Decoder: (B, num_latents, emb_dim) + t_query -> (B, N_queries, 2)
     config.decoder = decoder = ml_collections.ConfigDict()

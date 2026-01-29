@@ -449,7 +449,55 @@ def check_negative():
         if len(errors) > 10:
             print(f"  ... and {len(errors) - 10} more errors")
 
+
+def print_last_times():
+    """Scan all H5 files and print the last time value from each, excluding 2023_04-exb_paper folders."""
+    from pathlib import Path
+    import numpy as np
+    
+    folder_path = Path(FOLDER_PATH)
+    h5_files = sorted(folder_path.rglob("*.h5"))
+    
+    print("=" * 60)
+    print("Last time value from each H5 file")
+    print("(excluding 2023_04-exb_paper folders)")
+    print("=" * 60)
+    
+    last_times = []
+    folders_scanned = 0
+    
+    for h5_file in h5_files:
+        # Skip 2023_04-exb_paper folders
+        if "2023_04-exb_paper" in str(h5_file):
+            continue
+        
+        folders_scanned += 1
+        try:
+            with h5py.File(h5_file, 'r') as f:
+                if 'times' in f:
+                    times = f['times'][:]
+                    last_time = times[-1] if len(times) > 0 else None
+                    if last_time is not None:
+                        last_times.append(last_time)
+                    print(f"{h5_file.parent.name}: {last_time}")
+                else:
+                    print(f"{h5_file.parent.name}: No 'times' dataset found")
+        except Exception as e:
+            print(f"{h5_file.parent.name}: Error - {str(e)}")
+    
+    # Print summary statistics
+    print()
+    print("=" * 60)
+    print("Summary")
+    print("=" * 60)
+    print(f"Folders scanned: {folders_scanned}")
+    if last_times:
+        print(f"Min time: {np.min(last_times)}")
+        print(f"Max time: {np.max(last_times)}")
+        print(f"Mean time: {np.mean(last_times):.4f}")
+
+
 if __name__ == "__main__":
-    print_h5_times()
+    print_last_times()
 
 

@@ -80,12 +80,14 @@ class TimeSeriesEncoder(nn.Module):
         2. Fourier Time Embedding: (B, T, 1) -> (B, T, emb_dim) via Fourier features
         3. Fuse: element-wise addition of flux and time embeddings
         4. Perceiver Bottleneck: variable T -> fixed num_latents
-        5. Self-Attention Transformer Blocks
+        5. [Optional] Physics Conditioning: concatenate physics token to latents
+        6. Self-Attention Transformer Blocks
     
     Input: 
         x: (B, T, 2) flux time-series, T varies (or fixed if padded)
         t: (B, T, 1) normalized time coordinates τ (already normalized by dataset)
-    Output: (B, num_latents, emb_dim)
+        physics_params: Optional (B, num_physics_params) plasma physics parameters
+    Output: (B, num_latents [+1 if physics], emb_dim)
     
     Note on masking: When using padded sequences, padded positions are 0-valued.
     The model learns to ignore these through training. For proper attention masking,
@@ -107,16 +109,21 @@ class TimeSeriesEncoder(nn.Module):
     
     # Fourier embedding for time (must match decoder)
     fourier_freq: float = 50.0  # High frequency for turbulent oscillations
+    
+    # Physics conditioning (NEW)
+    use_physics_conditioning: bool = False
+    num_physics_params: int = 5  # DLNTDR_1, DLNNDR_1, KY, NU_EE, MASS_1
 
     @nn.compact
-    def __call__(self, x, t, mask=None):
+    def __call__(self, x, t, physics_params=None, mask=None):
         """
         Args:
             x: (B, T, C) input flux time-series, T varies or fixed
             t: (B, T, 1) normalized time coordinates τ (from dataset)
+            physics_params: Optional (B, num_physics_params) normalized physics parameters
             mask: Optional (B, T) mask where 1 = valid, 0 = padded (currently unused)
         Returns:
-            z: (B, num_latents, emb_dim) latent representation
+            z: (B, num_latents [+1], emb_dim) latent representation
         """
         b, t_seq, c = x.shape
         
@@ -146,7 +153,20 @@ class TimeSeriesEncoder(nn.Module):
             layer_norm_eps=self.layer_norm_eps,
         )(x)  # (B, num_latents, emb_dim)
         
-        # 5. Self-Attention Transformer Blocks
+        # 5. Physics Conditioning (NEW): project physics params and concatenate as extra token
+        if self.use_physics_conditioning and physics_params is not None:
+            # Two-layer MLP to project physics params to emb_dim
+            physics_emb = nn.Dense(self.emb_dim, name="physics_proj1")(physics_params)  # (B, emb_dim)
+            physics_emb = nn.gelu(physics_emb)
+            physics_emb = nn.Dense(self.emb_dim, name="physics_proj2")(physics_emb)      # (B, emb_dim)
+            
+            # Expand to token format: (B, emb_dim) -> (B, 1, emb_dim)
+            physics_token = physics_emb[:, None, :]  # (B, 1, emb_dim)
+            
+            # Concatenate physics token to dynamics latents
+            x = jnp.concatenate([x, physics_token], axis=1)  # (B, num_latents + 1, emb_dim)
+        
+        # 6. Self-Attention Transformer Blocks
         for _ in range(self.transformer_depth):
             x = SelfAttnBlock(
                 num_heads=self.num_heads,

@@ -86,9 +86,21 @@ def create_target_fae_state(config, encoder, decoder, tx):
     x = jnp.ones(config.x_dim)  # (B, T_dummy, 2)
     t = jnp.ones(config.t_dim)  # (B, T_dummy, 1) normalized time coordinates
     t_query = jnp.ones(config.t_query_dim)  # (B, N_q, 1) normalized time queries
-
-    encoder_params = encoder.init(random.PRNGKey(config.seed), x, t)
-    z = encoder.apply(encoder_params, x, t)  # (B, num_latents, emb_dim)
+    
+    # Check if physics conditioning is enabled
+    use_physics_conditioning = getattr(config.model.encoder, 'use_physics_conditioning', False)
+    num_physics_params = getattr(config.model.encoder, 'num_physics_params', 5)
+    
+    if use_physics_conditioning:
+        # Create dummy physics params for initialization
+        batch_size = config.x_dim[0]
+        physics_params = jnp.ones((batch_size, num_physics_params))
+        encoder_params = encoder.init(random.PRNGKey(config.seed), x, t, physics_params=physics_params)
+        z = encoder.apply(encoder_params, x, t, physics_params=physics_params)  # (B, num_latents+1, emb_dim)
+    else:
+        encoder_params = encoder.init(random.PRNGKey(config.seed), x, t)
+        z = encoder.apply(encoder_params, x, t)  # (B, num_latents, emb_dim)
+    
     decoder_params = decoder.init(random.PRNGKey(config.seed), z, t_query)
     params = (encoder_params, decoder_params)
 
@@ -157,24 +169,75 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
     print(f"Number of devices: {num_devices}")
     print(f"Number of local devices: {num_local_devices}")
 
-    # Create dataset split (80/10/10: train/val/test)
+    # Create dataset split (90/10: train/val)
+    # Note: No test set - we don't use it during training. Test evaluation done separately.
     # Use same seed for reproducibility
     all_folders = get_paired_folders(config.dataset.data_path)
     print(f"Total folders found: {len(all_folders)}")
     
-    # First split: 80% train, 20% temp (for val + test)
-    train_folders, temp_folders = train_test_split(
-        all_folders, test_size=0.2, random_state=config.seed
-    )
+    # Physics conditioning setup
+    use_physics_conditioning = getattr(config.dataset, 'use_physics_conditioning', False)
+    physics_csv_path = None
+    physics_param_columns = None
+    if use_physics_conditioning:
+        physics_csv_path = config.dataset.param_list_csv_path
+        physics_param_columns = list(config.dataset.physics_param_columns)
+        print(f"Physics conditioning enabled: {physics_param_columns}")
     
-    # Second split: 50% of temp = 10% of total for val, 10% for test
-    val_folders, test_folders = train_test_split(
-        temp_folders, test_size=0.5, random_state=config.seed
+    # Filter by CSV-based folder list (preferred for validated param spaces)
+    if getattr(config.dataset, 'use_param_list_csv', False):
+        import pandas as pd
+        csv_path = config.dataset.param_list_csv_path
+        params_df = pd.read_csv(csv_path, index_col='folder_name')
+        valid_folder_names = set(params_df.index)
+        
+        filtered_folders = [f for f in all_folders if f.name in valid_folder_names]
+        
+        if len(filtered_folders) == 0:
+            raise ValueError(
+                f"No folders found matching CSV entries from '{csv_path}'. "
+                f"Total folders available: {len(all_folders)}. "
+                f"CSV has {len(valid_folder_names)} entries."
+            )
+        
+        all_folders = filtered_folders
+        print(f"Filtered to CSV-validated folders: {len(all_folders)} folders")
+    
+    # Filter by parameter space if enabled (substring matching)
+    elif getattr(config.dataset, 'use_param_space', False):
+        param_space_name = config.dataset.param_space_name
+        if not param_space_name:
+            raise ValueError("use_param_space=True but param_space_name is empty. Please specify a parameter space name.")
+        
+        filtered_folders = [f for f in all_folders if param_space_name in f.name]
+        
+        if len(filtered_folders) == 0:
+            raise ValueError(
+                f"No folders found matching parameter space '{param_space_name}'. "
+                f"Total folders available: {len(all_folders)}. "
+                f"Check that param_space_name is correct."
+            )
+        
+        all_folders = filtered_folders
+        print(f"Filtered to parameter space '{param_space_name}': {len(all_folders)} folders")
+        
+        # Exclude specific runs if provided
+        excluded_runs = getattr(config.dataset, 'excluded_runs', [])
+        if excluded_runs:
+            before_count = len(all_folders)
+            all_folders = [f for f in all_folders if f.name not in excluded_runs]
+            excluded_count = before_count - len(all_folders)
+            print(f"Excluded {excluded_count} specific runs: {excluded_runs}")
+            print(f"Remaining folders: {len(all_folders)}")
+    
+    # Split: 90% train, 10% val
+    train_folders, val_folders = train_test_split(
+        all_folders, test_size=0.1, random_state=config.seed
     )
     
     print(f"Train: {len(train_folders)} samples ({100*len(train_folders)/len(all_folders):.1f}%)")
     print(f"Val: {len(val_folders)} samples ({100*len(val_folders)/len(all_folders):.1f}%)")
-    print(f"Test: {len(test_folders)} samples ({100*len(test_folders)/len(all_folders):.1f}%)")
+    
     
     # Create datasets
     use_padded = config.dataset.use_padded_sequences
@@ -199,7 +262,18 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             slice_by_time=slice_by_time,
             max_tau=max_tau,
             folder_list=train_folders,
+            # NEW: Random time window augmentation
+            use_random_window=getattr(config.dataset, 'use_random_window', False),
+            window_tau_size=getattr(config.dataset, 'window_tau_size', 0.1),
+            is_training=True,
+            # NEW: Physics conditioning
+            physics_csv_path=physics_csv_path if use_physics_conditioning else None,
+            physics_param_columns=physics_param_columns if use_physics_conditioning else None,
+            physics_stats=None,  # Compute from training set
         )
+        
+        # Get physics stats from training set to pass to validation
+        physics_stats = train_dataset.get_physics_stats() if use_physics_conditioning else None
 
         val_dataset = CGYRODataset(
             data_path=config.dataset.data_path,
@@ -212,6 +286,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             slice_by_time=slice_by_time,
             max_tau=max_tau,
             folder_list=val_folders,
+            # Validation: no random augmentation
+            use_random_window=False,
+            is_training=False,
+            # NEW: Physics conditioning (use training stats)
+            physics_csv_path=physics_csv_path if use_physics_conditioning else None,
+            physics_param_columns=physics_param_columns if use_physics_conditioning else None,
+            physics_stats=physics_stats,
         )
         train_stats = None  # Not used in per-sample mode
 
@@ -247,7 +328,18 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             slice_by_time=slice_by_time,
             max_tau=max_tau,
             folder_list=train_folders,
+            # NEW: Random time window augmentation
+            use_random_window=getattr(config.dataset, 'use_random_window', False),
+            window_tau_size=getattr(config.dataset, 'window_tau_size', 0.1),
+            is_training=True,
+            # NEW: Physics conditioning
+            physics_csv_path=physics_csv_path if use_physics_conditioning else None,
+            physics_param_columns=physics_param_columns if use_physics_conditioning else None,
+            physics_stats=None,  # Compute from training set
         )
+        
+        # Get physics stats from training set to pass to validation
+        physics_stats = train_dataset.get_physics_stats() if use_physics_conditioning else None
 
         # Create val dataset with same global stats
         val_dataset = CGYRODataset(
@@ -261,6 +353,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             slice_by_time=slice_by_time,
             max_tau=max_tau,
             folder_list=val_folders,
+            # Validation: no random augmentation
+            use_random_window=False,
+            is_training=False,
+            # NEW: Physics conditioning (use training stats)
+            physics_csv_path=physics_csv_path if use_physics_conditioning else None,
+            physics_param_columns=physics_param_columns if use_physics_conditioning else None,
+            physics_stats=physics_stats,
         )
 
     else:
@@ -276,7 +375,18 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             slice_by_time=slice_by_time,
             max_tau=max_tau,
             folder_list=train_folders,
+            # NEW: Random time window augmentation
+            use_random_window=getattr(config.dataset, 'use_random_window', False),
+            window_tau_size=getattr(config.dataset, 'window_tau_size', 0.1),
+            is_training=True,
+            # NEW: Physics conditioning
+            physics_csv_path=physics_csv_path if use_physics_conditioning else None,
+            physics_param_columns=physics_param_columns if use_physics_conditioning else None,
+            physics_stats=None,  # Compute from training set
         )
+        
+        # Get physics stats from training set to pass to validation
+        physics_stats = train_dataset.get_physics_stats() if use_physics_conditioning else None
 
         val_dataset = CGYRODataset(
             data_path=config.dataset.data_path,
@@ -288,6 +398,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             slice_by_time=slice_by_time,
             max_tau=max_tau,
             folder_list=val_folders,
+            # Validation: no random augmentation
+            use_random_window=False,
+            is_training=False,
+            # NEW: Physics conditioning (use training stats)
+            physics_csv_path=physics_csv_path if use_physics_conditioning else None,
+            physics_param_columns=physics_param_columns if use_physics_conditioning else None,
+            physics_stats=physics_stats,
         )
         train_stats = None
     
@@ -348,9 +465,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
         growth_phase_weight=growth_phase_weight,
         use_relative_l2=use_relative_l2,
         rel_l2_eps=rel_l2_eps,
+        use_physics_conditioning=use_physics_conditioning,
     )
     
-    eval_step = create_target_eval_step(encoder, decoder, mesh)
+    eval_step = create_target_eval_step(
+        encoder, decoder, mesh,
+        use_physics_conditioning=use_physics_conditioning,
+    )
     
     # batch_size logic:
     # - slice_by_time: variable lengths padded to max, can use larger batch size
@@ -434,6 +555,11 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
     print(f"Timestep range: [{train_dataset.lengths.min()}, {train_dataset.lengths.max()}]")
     print(f"Using time weighting: {use_time_weighting}")
     print(f"Using padded sequences: {use_padded}")
+    print(f"Using τ-uniform query sampling: True (finds nearest real data points)")
+    if getattr(config.dataset, 'use_random_window', False):
+        print(f"Random time window: enabled (window_tau_size={config.dataset.window_tau_size})")
+    else:
+        print(f"Random time window: disabled")
     print(f"Using per-sample normalization: {normalize_per_sample}")
     print(f"Using relative L2 loss: {use_relative_l2}")
     if use_relative_l2:
@@ -466,6 +592,11 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             time_coords = jnp.array(batch_data['time'])     # (B, T, 1) normalized time coordinates
             lengths = batch_data['lengths']  # (B,) original lengths or slice_length if sliced
             
+            # Extract physics params if using physics conditioning
+            batch_physics_params = None
+            if use_physics_conditioning and 'physics_params' in batch_data:
+                batch_physics_params = jnp.array(batch_data['physics_params'])  # (B, num_params)
+            
             if slice_by_time:
                 # Time-based slicing: variable lengths padded to max
                 # Use min of actual lengths in batch to ensure queries are in valid range
@@ -491,11 +622,17 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
                 actual_num_queries = min(num_queries, seq_len)
                 max_query_idx = None
             
-            # Prepare batch with random query sampling
-            # Note: queries sampled within valid range of shortest sequence in batch
-            # prepare_target_batch now extracts time values at query indices
-            batch = prepare_target_batch(cgyro, time_coords, actual_num_queries, subkey, 
-                                         max_query_idx=max_query_idx)
+            # Prepare batch with τ-uniform query sampling
+            # NEW: Samples τ values uniformly, finds nearest real data points per sample
+            # PREVIOUS: Sampled array indices uniformly, causing biased τ coverage
+            batch = prepare_target_batch(
+                cgyro, time_coords, actual_num_queries, subkey,
+                lengths=jnp.array(lengths),
+            )
+            
+            # Add physics params to batch if using physics conditioning
+            if batch_physics_params is not None:
+                batch['physics_params'] = batch_physics_params
             
             # Shard batch across devices
             batch = multihost_utils.host_local_array_to_global_array(
@@ -570,6 +707,11 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             time_coords_val = jnp.array(val_batch_data['time'])
             lengths_val = val_batch_data['lengths']
             
+            # Extract physics params if using physics conditioning
+            val_physics_params = None
+            if use_physics_conditioning and 'physics_params' in val_batch_data:
+                val_physics_params = jnp.array(val_batch_data['physics_params'])  # (B, num_params)
+            
             if slice_by_time:
                 # Time-based slicing: use min of actual lengths in batch
                 min_len = int(lengths_val.min())
@@ -589,8 +731,12 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             
             val_batch = prepare_target_batch(
                 cgyro_val, time_coords_val, actual_num_queries, val_subkey,
-                max_query_idx=max_query_idx
+                lengths=jnp.array(lengths_val),
             )
+            
+            # Add physics params to batch if using physics conditioning
+            if val_physics_params is not None:
+                val_batch['physics_params'] = val_physics_params
             
             # Shard batch across devices
             val_batch = multihost_utils.host_local_array_to_global_array(
@@ -604,6 +750,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
                 growth_phase_weight=growth_phase_weight,
                 use_relative_l2=use_relative_l2,
                 rel_l2_eps=rel_l2_eps,
+                use_physics_conditioning=use_physics_conditioning,
             )
             
             val_loss_sum += val_loss.item()

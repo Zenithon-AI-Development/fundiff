@@ -330,6 +330,15 @@ class CGYRODataset(Dataset):
 
     All folders in 2species_2fields are guaranteed to have both TGLF and CGYRO data.
 
+    Random Time Window Augmentation (NEW):
+        When use_random_window=True and is_training=True, each __getitem__ call
+        samples a random τ window of size window_tau_size from the full sequence.
+        This prevents the model from overfitting to always seeing τ=0 as the start
+        and increases effective sample diversity.
+        
+        PREVIOUS BEHAVIOR: Always used fixed slice starting from τ=0.
+        CURRENT BEHAVIOR: Randomly samples start point τ_start ∈ [0, τ_max - window_size].
+
     Args:
         data_path: Path to directory containing run folders (should be 2species_2fields)
         normalize: If True, apply global normalization (z-score across all samples)
@@ -346,6 +355,12 @@ class CGYRODataset(Dataset):
         max_tau: Maximum normalized time τ to include (only used if slice_by_time=True).
                  τ = (t - 3.0) / 1000.0, so max_tau=0.1 means t ∈ [3.0, 103.0].
         folder_list: Optional list of specific folders to use. If None, uses all paired folders.
+        use_random_window: If True, sample random τ windows during training (default: False)
+        window_tau_size: Size of random window in τ units (default: 0.1, same as max_tau)
+        is_training: If True, apply random augmentations. Set False for val/test (default: True)
+        physics_csv_path: Optional path to CSV with physics parameters (for conditioning)
+        physics_param_columns: List of column names to extract as physics params
+        physics_stats: Optional (mean, std) for physics normalization (from training set)
     """
 
     def __init__(
@@ -361,6 +376,14 @@ class CGYRODataset(Dataset):
         slice_by_time: bool = False,
         max_tau: float = 0.1,
         folder_list: Optional[List[Path]] = None,
+        # NEW: Random time window augmentation
+        use_random_window: bool = False,
+        window_tau_size: float = 0.1,
+        is_training: bool = True,
+        # NEW: Physics conditioning
+        physics_csv_path: Optional[str] = None,
+        physics_param_columns: Optional[List[str]] = None,
+        physics_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     ):
         self.data_path = Path(data_path)
         self.normalize = normalize
@@ -371,6 +394,14 @@ class CGYRODataset(Dataset):
         self.slice_length = slice_length
         self.slice_by_time = slice_by_time
         self.max_tau = max_tau
+        # NEW: Random time window augmentation
+        self.use_random_window = use_random_window
+        self.window_tau_size = window_tau_size
+        self.is_training = is_training
+        # NEW: Physics conditioning
+        self.physics_csv_path = physics_csv_path
+        self.physics_param_columns = physics_param_columns
+        self.use_physics_conditioning = physics_csv_path is not None and physics_param_columns is not None
 
         # Fixed time-scale and cutoff for normalized coordinates τ = (t - t0) / TIME_SCALE
         # This keeps inputs in a numerically friendly range for Fourier features.
@@ -388,6 +419,45 @@ class CGYRODataset(Dataset):
             raise ValueError(f"No valid folders found in {data_path}")
         
         print(f"CGYRODataset: Found {len(self.folders)} samples")
+        
+        # Load physics parameters from CSV if enabled
+        self.physics_params = None
+        self.physics_mean = None
+        self.physics_std = None
+        
+        if self.use_physics_conditioning:
+            import pandas as pd
+            print(f"CGYRODataset: Loading physics parameters from {physics_csv_path}")
+            print(f"CGYRODataset: Physics columns: {physics_param_columns}")
+            
+            params_df = pd.read_csv(physics_csv_path)
+            params_df = params_df.set_index('folder_name')
+            
+            # Extract physics params for each folder
+            physics_list = []
+            for folder in self.folders:
+                folder_name = folder.name
+                if folder_name not in params_df.index:
+                    raise ValueError(f"Folder {folder_name} not found in physics CSV")
+                row = params_df.loc[folder_name, physics_param_columns].values
+                physics_list.append(row.astype(np.float32))
+            
+            self.physics_params = np.stack(physics_list, axis=0)  # (N, num_params)
+            
+            # Normalize physics parameters (z-score)
+            if physics_stats is not None:
+                # Use provided stats (from training set for val/test)
+                self.physics_mean, self.physics_std = physics_stats
+                print(f"CGYRODataset: Using provided physics stats for normalization")
+            else:
+                # Compute stats from this dataset (training set)
+                self.physics_mean = self.physics_params.mean(axis=0, keepdims=True)  # (1, num_params)
+                self.physics_std = self.physics_params.std(axis=0, keepdims=True) + 1e-8  # (1, num_params)
+                print(f"CGYRODataset: Computed physics stats - mean: {self.physics_mean.flatten()}, std: {self.physics_std.flatten()}")
+            
+            # Apply normalization
+            self.physics_params = (self.physics_params - self.physics_mean) / self.physics_std
+            print(f"CGYRODataset: Physics params shape: {self.physics_params.shape}")
         
         # Load all data into memory (variable length sequences)
         # We now keep both flux and normalized time coordinates.
@@ -557,31 +627,94 @@ class CGYRODataset(Dataset):
         return len(self.folders)
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get a single sample, optionally with random time window augmentation.
+        
+        PREVIOUS BEHAVIOR: 
+            Returned fixed sliced/padded data directly from precomputed arrays.
+        
+        CURRENT BEHAVIOR:
+            If use_random_window=True and is_training=True, samples a random τ window
+            from the sequence before returning. This augmentation increases sample
+            diversity by varying which portion of the time series the model sees.
+        """
         if self.use_padding:
-            result = {
-                'cgyro': self.padded_data[idx],   # (max_seq_length or slice_length, 2)
-                'time': self.padded_times[idx],   # (max_seq_length or slice_length, 1)
-                'mask': self.masks[idx],          # (max_seq_length or slice_length,)
-                'length': self.lengths[idx],      # original length or slice_length
-            }
+            cgyro = self.padded_data[idx].copy()   # (T, 2) - copy to allow modification
+            time = self.padded_times[idx].copy()   # (T, 1)
+            mask = self.masks[idx].copy()          # (T,)
+            length = int(self.lengths[idx])
         else:
-            result = {
-                'cgyro': self.data[idx],          # (n_timesteps, 2) - variable! or (slice_length, 2) if sliced
-                'time': self.times[idx],          # (n_timesteps, 1)
-                'length': self.lengths[idx],
-            }
-
+            cgyro = self.data[idx].copy()
+            time = self.times[idx].copy()
+            length = int(self.lengths[idx])
+            mask = None
+        
+        # Random time window augmentation (training only)
+        if self.use_random_window and self.is_training:
+            # Get τ values for valid (non-padded) region
+            tau_values = time[:length, 0]
+            tau_min, tau_max = float(tau_values[0]), float(tau_values[-1])
+            available_range = tau_max - tau_min
+            
+            if available_range > self.window_tau_size:
+                # Sample random start point
+                max_start = tau_max - self.window_tau_size
+                tau_start = np.random.uniform(tau_min, max_start)
+                tau_end = tau_start + self.window_tau_size
+                
+                # Find indices within the random window
+                valid_mask_window = (tau_values >= tau_start) & (tau_values <= tau_end)
+                valid_indices = np.where(valid_mask_window)[0]
+                
+                if len(valid_indices) > 0:
+                    # Extract windowed data
+                    cgyro_window = cgyro[valid_indices]
+                    time_window = time[valid_indices]
+                    new_length = len(valid_indices)
+                    
+                    if self.use_padding:
+                        # Re-pad to original padded length
+                        pad_len = self.padded_data.shape[1]
+                        cgyro = np.zeros((pad_len, 2), dtype=np.float32)
+                        time = np.zeros((pad_len, 1), dtype=np.float32)
+                        mask = np.zeros(pad_len, dtype=np.float32)
+                        cgyro[:new_length] = cgyro_window
+                        time[:new_length] = time_window
+                        mask[:new_length] = 1.0
+                    else:
+                        cgyro = cgyro_window
+                        time = time_window
+                    
+                    length = new_length
+        
+        result = {
+            'cgyro': cgyro,
+            'time': time,
+            'length': length,
+        }
+        if mask is not None:
+            result['mask'] = mask
+        
         # Add per-sample normalization stats if available (for denormalization at inference)
         if self.sample_means is not None:
             result['sample_mean'] = self.sample_means[idx]  # (1, 2)
             result['sample_std'] = self.sample_stds[idx]    # (1, 2)
-
+        
+        # Add physics conditioning params if available
+        if self.physics_params is not None:
+            result['physics_params'] = self.physics_params[idx]  # (num_params,)
+        
         return result
     
     def get_stats(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Return normalization stats (mean, std) if computed."""
         if self.mean is not None and self.std is not None:
             return (self.mean, self.std)
+        return None
+    
+    def get_physics_stats(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Return physics normalization stats (mean, std) if computed."""
+        if self.physics_params is not None:
+            return (self.physics_mean, self.physics_std)
         return None
     
     def get_folder_name(self, idx: int) -> str:
@@ -654,6 +787,10 @@ def cgyro_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     if has_sample_stats:
         result['sample_mean'] = np.stack([item['sample_mean'] for item in batch], axis=0)  # (B, 1, 2)
         result['sample_std'] = np.stack([item['sample_std'] for item in batch], axis=0)    # (B, 1, 2)
+    
+    # Add physics conditioning params if present
+    if 'physics_params' in batch[0]:
+        result['physics_params'] = np.stack([item['physics_params'] for item in batch], axis=0)  # (B, num_params)
 
     return result
 

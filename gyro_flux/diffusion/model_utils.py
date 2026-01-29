@@ -115,6 +115,7 @@ def target_loss_fn(
     growth_phase_weight: float = 5.0,
     use_relative_l2: bool = False,
     rel_l2_eps: float = 1.0,
+    use_physics_conditioning: bool = False,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """Reconstruction loss for Target (CGYRO) FAE.
 
@@ -127,10 +128,12 @@ def target_loss_fn(
             - 'time': (B, T, 1) normalized time coordinates for input sequence
             - 't_query': (B, N_q, 1) normalized time coordinates to reconstruct
             - 'targets': (B, N_q, 2) ground truth flux at query times
+            - 'physics_params': (B, num_params) optional physics conditioning params
         use_time_weighting: If True, weight early timesteps more heavily
         growth_phase_weight: Weight multiplier for growth phase (τ < 0.03)
         use_relative_l2: If True, use relative L2 loss (scale-invariant)
         rel_l2_eps: Epsilon for relative L2 denominator stability
+        use_physics_conditioning: If True, pass physics_params to encoder
 
     Returns:
         loss: scalar loss value
@@ -143,8 +146,12 @@ def target_loss_fn(
     t_query = batch['t_query']  # (B, N_q, 1)
     targets = batch['targets']  # (B, N_q, 2)
 
-    # Encode (with time coordinates)
-    z = encoder.apply(encoder_params, cgyro, time)  # (B, num_latents, emb_dim)
+    # Encode (with time coordinates and optional physics conditioning)
+    if use_physics_conditioning:
+        physics_params = batch['physics_params']  # (B, num_params)
+        z = encoder.apply(encoder_params, cgyro, time, physics_params=physics_params)  # (B, num_latents+1, emb_dim)
+    else:
+        z = encoder.apply(encoder_params, cgyro, time)  # (B, num_latents, emb_dim)
 
     # Decode at query times
     recon = decoder.apply(decoder_params, z, t_query)  # (B, N_q, 2)
@@ -185,6 +192,7 @@ def create_target_train_step(
     growth_phase_weight: float = 5.0,
     use_relative_l2: bool = False,
     rel_l2_eps: float = 1.0,
+    use_physics_conditioning: bool = False,
 ):
     """Create sharded train step for Target FAE.
 
@@ -196,6 +204,7 @@ def create_target_train_step(
         growth_phase_weight: Weight multiplier for growth phase
         use_relative_l2: If True, use relative L2 loss (scale-invariant)
         rel_l2_eps: Epsilon for relative L2 denominator stability
+        use_physics_conditioning: If True, pass physics_params to encoder
 
     Returns:
         train_step function
@@ -218,6 +227,7 @@ def create_target_train_step(
                 growth_phase_weight=growth_phase_weight,
                 use_relative_l2=use_relative_l2,
                 rel_l2_eps=rel_l2_eps,
+                use_physics_conditioning=use_physics_conditioning,
             ),
             has_aux=True,
         )
@@ -301,10 +311,16 @@ def create_tglf_eval_step(encoder, decoder, mesh):
     return eval_step
 
 
-def create_target_eval_step(encoder, decoder, mesh):
+def create_target_eval_step(encoder, decoder, mesh, use_physics_conditioning: bool = False):
     """Create sharded eval step for Target FAE.
     
     Supports both in-distribution evaluation (with targets) and OOD testing (without targets).
+    
+    Args:
+        encoder: TimeSeriesEncoder module
+        decoder: ContinuousTimeDecoder module
+        mesh: JAX device mesh for sharding
+        use_physics_conditioning: If True, pass physics_params to encoder
     """
     @jax.jit
     @partial(
@@ -320,7 +336,11 @@ def create_target_eval_step(encoder, decoder, mesh):
         time = batch['time']
         t_query = batch['t_query']
         
-        z = encoder.apply(encoder_params, cgyro, time)
+        if use_physics_conditioning:
+            physics_params = batch['physics_params']
+            z = encoder.apply(encoder_params, cgyro, time, physics_params=physics_params)
+        else:
+            z = encoder.apply(encoder_params, cgyro, time)
         recon = decoder.apply(decoder_params, z, t_query)
         return recon
     
@@ -382,42 +402,87 @@ def prepare_target_batch(
     num_queries: int,
     rng_key: jnp.ndarray,
     max_query_idx: int = None,
+    lengths: jnp.ndarray = None,
 ) -> Dict[str, jnp.ndarray]:
-    """Prepare a training batch for Target FAE.
+    """Prepare a training batch for Target FAE with τ-uniform query sampling.
     
-    Samples random timestep indices, then extracts their corresponding time values.
-    Returns continuous time queries instead of step indices.
+    PREVIOUS BEHAVIOR (deprecated):
+        Sampled array indices uniformly via random.choice(). This caused biased
+        τ coverage because samples have different time densities - a batch's
+        early/late phase ratio depended on which samples happened to be included.
+        Diagnostic runs showed strong correlation between early_phase_ratio and loss.
+    
+    CURRENT BEHAVIOR:
+        Samples τ values uniformly across [τ_min, τ_max] of the batch, then finds
+        the nearest actual data point index per sample. This ensures balanced
+        coverage of early/mid/late phases regardless of batch composition.
     
     Args:
-        cgyro: (B, T, 2) flux history
-        time: (B, T, 1) normalized time coordinates
+        cgyro: (B, T, 2) flux history (may be padded)
+        time: (B, T, 1) normalized time coordinates τ (may be padded)
         num_queries: Number of timesteps to query
         rng_key: PRNG key for random sampling
-        max_query_idx: Optional max index for queries (for padded mode, use shortest seq in batch)
+        max_query_idx: DEPRECATED - use lengths instead. Kept for backward compatibility.
+        lengths: (B,) actual sequence lengths per sample (required for padded sequences)
     
     Returns:
         batch dict with 'cgyro', 'time', 't_query', 'targets'
     """
     b, num_steps, num_channels = cgyro.shape
     
-    # For padded sequences, only sample from valid (non-padded) range
-    query_range = max_query_idx if max_query_idx is not None else num_steps
+    # Get the valid τ range from the batch
+    if lengths is not None:
+        # Padded mode: each sample has different valid length
+        # τ_min is at index 0, τ_max is at index (length - 1)
+        tau_min = time[:, 0, 0]  # (B,)
+        batch_indices = jnp.arange(b)
+        length_indices = jnp.clip(lengths.astype(jnp.int32) - 1, 0, num_steps - 1)
+        tau_max = time[batch_indices, length_indices, 0]  # (B,)
+    elif max_query_idx is not None:
+        # Legacy mode: single max index for all samples
+        tau_min = time[:, 0, 0]
+        tau_max = time[:, max_query_idx - 1, 0]
+    else:
+        # No padding - all samples use full sequence
+        tau_min = time[:, 0, 0]  # (B,)
+        tau_max = time[:, -1, 0]  # (B,)
     
-    # Sample random step indices within valid range
-    step_indices = random.choice(
+    # Use conservative τ range that all samples can satisfy
+    global_tau_min = tau_min.max()  # latest start across batch
+    global_tau_max = tau_max.min()  # earliest end across batch
+    
+    # Sample τ values uniformly in the valid range
+    sampled_tau = random.uniform(
         rng_key,
-        query_range,
         shape=(num_queries,),
-        replace=False,
+        minval=global_tau_min,
+        maxval=global_tau_max,
     )  # (N_q,)
     
-    # Get targets at query positions
-    targets = cgyro[:, step_indices, :]  # (B, N_q, 2)
+    # For each sample, find nearest index to each sampled τ
+    time_squeezed = time[:, :, 0]  # (B, T)
     
-    # Extract time values at query positions
-    # time is (B, T, 1), step_indices is (N_q,)
-    # Use advanced indexing to get (B, N_q, 1)
-    t_query = time[:, step_indices, :]  # (B, N_q, 1)
+    # Compute |time - sampled_tau|: (B, T, N_q)
+    tau_diff = jnp.abs(time_squeezed[:, :, None] - sampled_tau[None, None, :])
+    
+    # Mask out padded positions so they're never selected
+    if lengths is not None:
+        indices = jnp.arange(num_steps)[None, :]  # (1, T)
+        valid_mask = indices < lengths[:, None]    # (B, T)
+        tau_diff = jnp.where(valid_mask[:, :, None], tau_diff, jnp.inf)
+    elif max_query_idx is not None:
+        # Legacy: mask beyond max_query_idx
+        indices = jnp.arange(num_steps)[None, :]
+        valid_mask = indices < max_query_idx
+        tau_diff = jnp.where(valid_mask[:, :, None], tau_diff, jnp.inf)
+    
+    # Find nearest index per sample per query: (B, N_q)
+    nearest_indices = jnp.argmin(tau_diff, axis=1)
+    
+    # Gather targets and t_query using advanced indexing
+    batch_idx = jnp.arange(b)[:, None]  # (B, 1)
+    targets = cgyro[batch_idx, nearest_indices, :]  # (B, N_q, 2)
+    t_query = time[batch_idx, nearest_indices, :]   # (B, N_q, 1)
     
     return {
         'cgyro': cgyro,

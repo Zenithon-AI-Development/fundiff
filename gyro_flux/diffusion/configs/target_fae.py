@@ -32,10 +32,10 @@ def get_base_config():
     wandb.use_wandb = True              # Set True to enable W&B logging
     wandb.project = "gyro_flux_target_training"
     wandb.entity = "Zenithon-AI"
-    wandb.group = "week19jan"
-    wandb.run_name = "target-fae-v3-diagnostic"  # Diagnostic run
-    wandb.notes = "v3 diagnostic: Logging padding_ratio and query distribution to identify bimodal loss cause. Same model as v3-timeslice."
-    wandb.tag = None
+    wandb.group = "week26jan"
+    wandb.run_name = "target-fae-global-norm-physics-cond-v1"
+    wandb.notes = "GLOBAL NORM + PHYSICS COND: Test if physics conditioning helps when magnitude info preserved via global norm."
+    wandb.tags = ["target_fae", "global_norm", "physics_cond"]
 
     # Dataset
     config.dataset = dataset = ml_collections.ConfigDict()
@@ -59,9 +59,32 @@ def get_base_config():
     dataset.slice_by_time = True         # Use physical time instead of array indices
     dataset.max_tau = 0.1                # Max normalized time to include (100 time units of physics)
 
+    # Random time window augmentation (NEW)
+    # PREVIOUS: Always used fixed slice starting from τ=0.
+    # CURRENT: Randomly samples start point τ_start ∈ [0, τ_max - window_size] per sample.
+    # This prevents overfitting to early-phase patterns and increases sample diversity.
+    dataset.use_random_window = True     # Enabled for random window augmentation
+    dataset.window_tau_size = 0.1        # Window size in τ units (matches max_tau)
+
+    # Parameter space filtering
+    # Option 1: Substring matching (original)
+    dataset.use_param_space = False      # Set True to filter by parameter space substring
+    dataset.param_space_name = ""        # Substring to match in folder names
+    dataset.excluded_runs = []           # Specific runs to exclude
+    
+    # Option 2: CSV-based filtering (NEW - preferred for validated param spaces)
+    dataset.use_param_list_csv = True    # Set True to use CSV for folder filtering
+    dataset.param_list_csv_path = "gyro_flux/validated_parameters.csv"  # Relative path (CSV bundled with code)
+    
+    # Physics conditioning (NEW)
+    # Inject plasma physics parameters as conditioning token in encoder
+    dataset.use_physics_conditioning = True   # ENABLED: Test with global norm
+    dataset.physics_param_columns = ["DLNTDR_1", "DLNNDR_1", "KY", "NU_EE", "MASS_1"]  # 5 varying params
+
     # Normalization: addresses 324x magnitude variation across files
-    dataset.normalize_per_sample = True   # Normalize each sample to zero mean, unit std (recommended)
-    dataset.normalize_global = False      # Global z-score normalization (alternative)
+    # PHASE 1 EXPERIMENT: Global norm preserves magnitude info for physics conditioning
+    dataset.normalize_per_sample = False  # DISABLED: Use global norm instead
+    dataset.normalize_global = True       # ENABLED: Preserves inter-sample magnitude differences
 
     # Learning rate schedule
     config.lr = lr = ml_collections.ConfigDict()
