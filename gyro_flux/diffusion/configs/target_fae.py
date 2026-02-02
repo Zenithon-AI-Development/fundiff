@@ -33,9 +33,9 @@ def get_base_config():
     wandb.project = "gyro_flux_target_training"
     wandb.entity = "Zenithon-AI"
     wandb.group = "week26jan"
-    wandb.run_name = "target-fae-global-norm-baseline-v1"
-    wandb.notes = "GLOBAL NORM CONTROL: Same as physics-cond run but WITHOUT physics conditioning. Baseline comparison."
-    wandb.tags = ["target_fae", "global_norm", "baseline"]
+    wandb.run_name = "target-fae-skip-perceiver-film-v1"
+    wandb.notes = "SKIP-PERCEIVER: Full self-attention with explicit masking, FiLM physics conditioning. Tests if Perceiver bottleneck is lossy."
+    wandb.tags = ["target_fae", "skip_perceiver", "film_conditioning", "global_norm"]
 
     # Dataset
     config.dataset = dataset = ml_collections.ConfigDict()
@@ -78,7 +78,7 @@ def get_base_config():
     
     # Physics conditioning (NEW)
     # Inject plasma physics parameters as conditioning token in encoder
-    dataset.use_physics_conditioning = False   # ENABLED: Test with global norm
+    dataset.use_physics_conditioning = True    # ENABLED: Skip-Perceiver with FiLM
     dataset.physics_param_columns = ["DLNTDR_1", "DLNNDR_1", "KY", "NU_EE", "MASS_1"]  # 5 varying params
 
     # Normalization: addresses 324x magnitude variation across files

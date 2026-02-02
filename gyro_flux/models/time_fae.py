@@ -30,6 +30,12 @@ from function_diffusion.models.fae import (
     CrossAttnBlock,
     FourierEmbs,
     Mlp,
+    # Skip-Perceiver components
+    create_attention_mask,
+    MaskedSelfAttnBlock,
+    MaskedCrossAttnBlock,
+    FiLMConditioning,
+    ReadoutPooling,
 )
 
 
@@ -177,8 +183,145 @@ class TimeSeriesEncoder(nn.Module):
         
         # Final LayerNorm
         x = nn.LayerNorm(epsilon=self.layer_norm_eps)(x)
-        
+
         return x
+
+
+class TimeSeriesEncoderSkipPerceiver(nn.Module):
+    """Encoder for CGYRO flux WITHOUT Perceiver bottleneck.
+
+    Skip-Perceiver architecture that performs full self-attention on the
+    sequence before compressing to fixed-size representation. This avoids
+    information loss from early bottlenecking.
+
+    Key differences from TimeSeriesEncoder:
+    - No Perceiver block: full sequence self-attention first
+    - Explicit attention masking: padded positions get -inf attention scores
+    - FiLM physics conditioning: applied early (before attention), not post-hoc
+    - ReadoutPooling: compresses AFTER self-attention via learnable query tokens
+
+    Pipeline:
+        1. Pointwise Flux Embedding: (B, T, 2) -> (B, T, emb_dim)
+        2. Fourier Time Embedding: (B, T, 1) -> (B, T, emb_dim)
+        3. Fuse: element-wise addition
+        4. FiLM Physics Conditioning: scale/shift features based on physics params
+        5. Masked Self-Attention Transformer: full sequence with explicit masking
+        6. ReadoutPooling: aggregate to fixed-size via cross-attention
+
+    Input:
+        x: (B, T_pad, 2) flux time-series (padded to max length)
+        t: (B, T_pad, 1) normalized time coordinates τ
+        physics_params: Optional (B, num_physics_params) plasma physics parameters
+        mask: Optional (B, T_pad) validity mask (1=valid, 0=padding)
+        lengths: Optional (B,) actual sequence lengths
+    Output: (B, num_readout, emb_dim)
+    """
+    # Input specs
+    in_channels: int = 2
+    emb_dim: int = 256
+
+    # Readout pooling (replaces Perceiver)
+    num_readout: int = 64  # Number of output tokens (like num_latents)
+    readout_depth: int = 2  # Cross-attention layers in readout
+
+    # Transformer
+    transformer_depth: int = 6
+    num_heads: int = 8
+    mlp_ratio: int = 2
+    layer_norm_eps: float = 1e-5
+
+    # Fourier embedding for time (must match decoder)
+    fourier_freq: float = 50.0
+
+    # Physics conditioning
+    use_physics_conditioning: bool = False
+    num_physics_params: int = 5  # DLNTDR_1, DLNNDR_1, KY, NU_EE, MASS_1
+    physics_conditioning_type: str = "film"  # "film", "token", or "none"
+
+    @nn.compact
+    def __call__(self, x, t, physics_params=None, mask=None, lengths=None):
+        """
+        Args:
+            x: (B, T_pad, C) input flux time-series (padded)
+            t: (B, T_pad, 1) normalized time coordinates τ
+            physics_params: Optional (B, num_physics_params) normalized physics parameters
+            mask: Optional (B, T_pad) validity mask (True=valid, False=padding)
+            lengths: Optional (B,) actual sequence lengths (used to create mask)
+        Returns:
+            z: (B, num_readout, emb_dim) latent representation
+        """
+        b, t_seq, c = x.shape
+
+        # Create attention mask from lengths if provided
+        if lengths is not None and mask is None:
+            # Create 1D mask from lengths: (B, T_pad)
+            positions = jnp.arange(t_seq)
+            mask = positions[None, :] < lengths[:, None]  # (B, T_pad)
+
+        # Create 2D attention mask for self-attention
+        if lengths is not None:
+            attn_mask = create_attention_mask(lengths, t_seq)  # (B, 1, T, T)
+        else:
+            attn_mask = None
+
+        # 1. Pointwise Flux Embedding
+        x_emb = nn.Dense(self.emb_dim, name="flux_proj")(x)  # (B, T_pad, emb_dim)
+
+        # 2. Fourier Time Embedding
+        if t.ndim == 2:
+            t = t[..., None]
+
+        t_emb = FourierEmbs(
+            embed_scale=self.fourier_freq,
+            embed_dim=self.emb_dim,
+        )(t)  # (B, T_pad, emb_dim)
+
+        # 3. Fuse flux and time embeddings
+        x = x_emb + t_emb  # (B, T_pad, emb_dim)
+
+        # 4. Physics Conditioning (EARLY - before self-attention)
+        if self.use_physics_conditioning and physics_params is not None:
+            if self.physics_conditioning_type == "film":
+                # FiLM: modulate ALL tokens with physics-based scale/shift
+                x = FiLMConditioning(emb_dim=self.emb_dim)(x, physics_params)
+            elif self.physics_conditioning_type == "token":
+                # Token: add physics as extra token (prepend so mask is simpler)
+                physics_emb = nn.Dense(self.emb_dim, name="physics_proj1")(physics_params)
+                physics_emb = nn.gelu(physics_emb)
+                physics_emb = nn.Dense(self.emb_dim, name="physics_proj2")(physics_emb)
+                physics_token = physics_emb[:, None, :]  # (B, 1, emb_dim)
+                x = jnp.concatenate([physics_token, x], axis=1)  # (B, T_pad+1, emb_dim)
+
+                # Update mask/attn_mask for the extra token
+                if mask is not None:
+                    physics_mask = jnp.ones((b, 1), dtype=mask.dtype)
+                    mask = jnp.concatenate([physics_mask, mask], axis=1)
+                if lengths is not None:
+                    # Recompute attn_mask with +1 for physics token
+                    new_lengths = lengths + 1
+                    attn_mask = create_attention_mask(new_lengths, t_seq + 1)
+
+        # 5. Masked Self-Attention Transformer (full sequence)
+        for _ in range(self.transformer_depth):
+            x = MaskedSelfAttnBlock(
+                num_heads=self.num_heads,
+                emb_dim=self.emb_dim,
+                mlp_ratio=self.mlp_ratio,
+                layer_norm_eps=self.layer_norm_eps,
+            )(x, mask=attn_mask)
+
+        # 6. ReadoutPooling: aggregate to fixed-size representation
+        # Uses cross-attention with learnable readout tokens as queries
+        z = ReadoutPooling(
+            num_readout=self.num_readout,
+            emb_dim=self.emb_dim,
+            num_heads=self.num_heads,
+            depth=self.readout_depth,
+            mlp_ratio=self.mlp_ratio,
+            layer_norm_eps=self.layer_norm_eps,
+        )(x, mask=mask)  # (B, num_readout, emb_dim)
+
+        return z
 
 
 class ContinuousTimeDecoder(nn.Module):

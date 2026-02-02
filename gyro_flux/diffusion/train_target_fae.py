@@ -33,7 +33,7 @@ import optax
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from gyro_flux.models import TimeSeriesEncoder, ContinuousTimeDecoder
+from gyro_flux.models import TimeSeriesEncoder, TimeSeriesEncoderSkipPerceiver, ContinuousTimeDecoder
 from gyro_flux.data_utils import CGYRODataset, create_cgyro_dataloader, get_paired_folders
 from gyro_flux.diffusion.model_utils import (
     create_target_train_step,
@@ -78,7 +78,7 @@ def create_optimizer(config):
 
 def create_target_fae_state(config, encoder, decoder, tx):
     """Initialize encoder and decoder parameters.
-    
+
     Note: For variable-length input, we use a fixed dummy size for init.
     The model now uses explicit time coordinates instead of positional embeddings.
     """
@@ -86,21 +86,27 @@ def create_target_fae_state(config, encoder, decoder, tx):
     x = jnp.ones(config.x_dim)  # (B, T_dummy, 2)
     t = jnp.ones(config.t_dim)  # (B, T_dummy, 1) normalized time coordinates
     t_query = jnp.ones(config.t_query_dim)  # (B, N_q, 1) normalized time queries
-    
+    batch_size = config.x_dim[0]
+    seq_len = config.x_dim[1]
+
     # Check if physics conditioning is enabled
     use_physics_conditioning = getattr(config.model.encoder, 'use_physics_conditioning', False)
     num_physics_params = getattr(config.model.encoder, 'num_physics_params', 5)
-    
+
+    # Check if skip-perceiver architecture (needs lengths for masking)
+    encoder_architecture = getattr(config.model.encoder, 'architecture', 'perceiver')
+
+    # Build kwargs for encoder init
+    encoder_kwargs = {'x': x, 't': t}
     if use_physics_conditioning:
-        # Create dummy physics params for initialization
-        batch_size = config.x_dim[0]
-        physics_params = jnp.ones((batch_size, num_physics_params))
-        encoder_params = encoder.init(random.PRNGKey(config.seed), x, t, physics_params=physics_params)
-        z = encoder.apply(encoder_params, x, t, physics_params=physics_params)  # (B, num_latents+1, emb_dim)
-    else:
-        encoder_params = encoder.init(random.PRNGKey(config.seed), x, t)
-        z = encoder.apply(encoder_params, x, t)  # (B, num_latents, emb_dim)
-    
+        encoder_kwargs['physics_params'] = jnp.ones((batch_size, num_physics_params))
+    if encoder_architecture == 'skip_perceiver':
+        # Skip-perceiver needs lengths for attention mask
+        encoder_kwargs['lengths'] = jnp.full((batch_size,), seq_len, dtype=jnp.int32)
+
+    encoder_params = encoder.init(random.PRNGKey(config.seed), **encoder_kwargs)
+    z = encoder.apply(encoder_params, **encoder_kwargs)
+
     decoder_params = decoder.init(random.PRNGKey(config.seed), z, t_query)
     params = (encoder_params, decoder_params)
 
@@ -121,6 +127,40 @@ def compute_total_params(state):
     else:
         print(f"Total number of parameters: {total_params / 1_000:.2f} thousand")
     return total_params
+
+
+def create_encoder(encoder_config, architecture='perceiver'):
+    """Create encoder based on architecture config.
+
+    Args:
+        encoder_config: dict of encoder parameters
+        architecture: 'perceiver' (default) or 'skip_perceiver'
+
+    Returns:
+        Encoder module (TimeSeriesEncoder or TimeSeriesEncoderSkipPerceiver)
+    """
+    if architecture == 'skip_perceiver':
+        # Skip-Perceiver: remove Perceiver-specific params, add Skip-Perceiver params
+        skip_perceiver_config = {
+            'in_channels': encoder_config.get('in_channels', 2),
+            'emb_dim': encoder_config.get('emb_dim', 128),
+            'num_readout': encoder_config.get('num_readout', 64),
+            'readout_depth': encoder_config.get('readout_depth', 2),
+            'transformer_depth': encoder_config.get('transformer_depth', 6),
+            'num_heads': encoder_config.get('num_heads', 4),
+            'mlp_ratio': encoder_config.get('mlp_ratio', 2),
+            'layer_norm_eps': encoder_config.get('layer_norm_eps', 1e-5),
+            'fourier_freq': encoder_config.get('fourier_freq', 150.0),
+            'use_physics_conditioning': encoder_config.get('use_physics_conditioning', False),
+            'num_physics_params': encoder_config.get('num_physics_params', 5),
+            'physics_conditioning_type': encoder_config.get('physics_conditioning_type', 'film'),
+        }
+        return TimeSeriesEncoderSkipPerceiver(**skip_perceiver_config)
+    else:
+        # Perceiver (default): use original encoder
+        perceiver_config = {k: v for k, v in encoder_config.items()
+                           if k not in ['architecture', 'num_readout', 'readout_depth', 'physics_conditioning_type']}
+        return TimeSeriesEncoder(**perceiver_config)
 
 
 # =============================================================================
@@ -150,9 +190,17 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
     # Time-based slicing parameters (new, recommended approach)
     slice_by_time = getattr(config.dataset, 'slice_by_time', False)
     max_tau = getattr(config.dataset, 'max_tau', 0.1)
-    
-    # Note: encoder will be re-initialized after dataset creation if slice_length was adjusted
-    encoder = TimeSeriesEncoder(**encoder_config)
+
+    # Select encoder architecture based on config
+    encoder_architecture = getattr(config.model.encoder, 'architecture', 'perceiver')
+    print(f"Encoder architecture: {encoder_architecture}")
+
+    # Create encoder using helper function
+    encoder = create_encoder(encoder_config, encoder_architecture)
+    if encoder_architecture == 'skip_perceiver':
+        print(f"  Physics conditioning type: {encoder_config.get('physics_conditioning_type', 'film')}")
+        print(f"  Num readout tokens: {encoder_config.get('num_readout', 64)}")
+
     decoder = ContinuousTimeDecoder(**config.model.decoder)
     
     # Create learning rate schedule and optimizer
@@ -420,8 +468,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
         config.x_dim = [2, actual_pad_length, 2]
         config.t_dim = [2, actual_pad_length, 1]
 
-        # Re-initialize encoder with correct dimensions
-        encoder = TimeSeriesEncoder(**encoder_config)
+        # Re-initialize encoder with correct dimensions (using same architecture)
+        encoder = create_encoder(encoder_config, encoder_architecture)
         state = create_target_fae_state(config, encoder, decoder, tx)
         print(f"Time-based slicing: Re-initialized model with padded length={actual_pad_length}")
 
@@ -437,7 +485,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict):
             config.x_dim = [2, slice_length, 2]
             config.t_dim = [2, slice_length, 1]
             # Re-initialize encoder (no changes needed to encoder_config, just re-init with same config)
-            encoder = TimeSeriesEncoder(**encoder_config)
+            encoder = create_encoder(encoder_config, encoder_architecture)
             # Re-create train state with updated encoder
             state = create_target_fae_state(config, encoder, decoder, tx)
             print(f"Slice mode: Re-initialized model with adjusted slice_length={slice_length}")

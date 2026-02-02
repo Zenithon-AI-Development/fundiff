@@ -128,6 +128,288 @@ class CrossAttnBlock(nn.Module):
         return x + y
 
 
+# =============================================================================
+# Skip-Perceiver Components (Masked Attention for Variable-Length Sequences)
+# =============================================================================
+
+def create_attention_mask(lengths: jnp.ndarray, max_len: int) -> jnp.ndarray:
+    """Create bidirectional attention mask from sequence lengths.
+
+    Args:
+        lengths: (B,) actual sequence lengths per sample
+        max_len: T_pad, the padded sequence length
+
+    Returns:
+        mask: (B, 1, T, T) attention mask where:
+              True = attend, False = don't attend (will become -inf)
+    """
+    # Step 1: Create 1D validity mask (B, T)
+    # Example: lengths=[3,2], max_len=4 → [[T,T,T,F], [T,T,F,F]]
+    positions = jnp.arange(max_len)  # [0, 1, 2, ..., T-1]
+    mask_1d = positions[None, :] < lengths[:, None]  # (B, T)
+
+    # Step 2: Create 2D mask (B, T, T)
+    # Position i can attend to position j iff BOTH are valid
+    # mask_2d[b, i, j] = mask_1d[b, i] AND mask_1d[b, j]
+    mask_2d = mask_1d[:, :, None] & mask_1d[:, None, :]  # (B, T, T)
+
+    # Step 3: Add head dimension (B, 1, T, T) for broadcasting over heads
+    mask_2d = mask_2d[:, None, :, :]
+
+    return mask_2d
+
+
+def create_cross_attention_mask(q_lengths: jnp.ndarray, kv_lengths: jnp.ndarray,
+                                 q_max_len: int, kv_max_len: int) -> jnp.ndarray:
+    """Create cross-attention mask from query and key-value lengths.
+
+    Args:
+        q_lengths: (B,) actual query lengths per sample
+        kv_lengths: (B,) actual key-value lengths per sample
+        q_max_len: Padded query length
+        kv_max_len: Padded key-value length
+
+    Returns:
+        mask: (B, 1, Q, KV) attention mask
+    """
+    # Query validity: (B, Q)
+    q_positions = jnp.arange(q_max_len)
+    q_valid = q_positions[None, :] < q_lengths[:, None]
+
+    # KV validity: (B, KV)
+    kv_positions = jnp.arange(kv_max_len)
+    kv_valid = kv_positions[None, :] < kv_lengths[:, None]
+
+    # Cross mask: (B, Q, KV) - query i can attend to kv j iff both valid
+    mask_2d = q_valid[:, :, None] & kv_valid[:, None, :]
+
+    # Add head dimension
+    return mask_2d[:, None, :, :]
+
+
+class MaskedSelfAttnBlock(nn.Module):
+    """Self-attention with explicit padding mask support.
+
+    Unlike SelfAttnBlock, this explicitly masks padded positions with -inf
+    in attention scores before softmax, ensuring zero attention to padding.
+    """
+    num_heads: int
+    emb_dim: int
+    mlp_ratio: int = 2
+    layer_norm_eps: float = 1e-5
+
+    @nn.compact
+    def __call__(self, x, mask=None):
+        """
+        Args:
+            x: (B, T, D) input sequence
+            mask: (B, 1, T, T) attention mask (True=attend, False=mask out)
+                  If None, no masking is applied.
+
+        Returns:
+            (B, T, D) output with masked attention
+        """
+        B, T, D = x.shape
+        head_dim = D // self.num_heads
+
+        # Pre-norm
+        x_norm = nn.LayerNorm(epsilon=self.layer_norm_eps)(x)
+
+        # Project to Q, K, V
+        qkv = nn.Dense(3 * D, name='qkv')(x_norm)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+
+        # Reshape for multi-head: (B, T, D) → (B, heads, T, head_dim)
+        q = q.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+
+        # Compute attention scores: (B, heads, T, T)
+        scale = head_dim ** -0.5
+        scores = jnp.einsum('bhid,bhjd->bhij', q, k) * scale
+
+        # EXPLICIT MASKING: Set padding positions to -inf
+        if mask is not None:
+            # mask: (B, 1, T, T), broadcasts over heads
+            # Where mask is False, set score to large negative value
+            scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
+
+        # Softmax → attention weights (softmax(-inf) = 0)
+        attn = jax.nn.softmax(scores, axis=-1)
+
+        # Apply attention to values
+        out = jnp.einsum('bhij,bhjd->bhid', attn, v)
+
+        # Reshape back: (B, heads, T, head_dim) → (B, T, D)
+        out = out.transpose(0, 2, 1, 3).reshape(B, T, D)
+
+        # Output projection
+        out = nn.Dense(D, name='out_proj')(out)
+
+        # Residual connection
+        x = x + out
+
+        # MLP block with pre-norm
+        y = nn.LayerNorm(epsilon=self.layer_norm_eps)(x)
+        y = MlpBlock(self.emb_dim * self.mlp_ratio, self.emb_dim)(y)
+
+        return x + y
+
+
+class MaskedCrossAttnBlock(nn.Module):
+    """Cross-attention with explicit key-value mask support.
+
+    Queries attend to key-value pairs, with explicit masking for padded KV positions.
+    """
+    num_heads: int
+    emb_dim: int
+    mlp_ratio: int = 2
+    layer_norm_eps: float = 1e-5
+
+    @nn.compact
+    def __call__(self, q_inputs, kv_inputs, kv_mask=None):
+        """
+        Args:
+            q_inputs: (B, Q, D) query sequence
+            kv_inputs: (B, KV, D) key-value sequence
+            kv_mask: (B, KV) or (B, 1, 1, KV) mask for KV positions
+                     True=valid, False=padding. If None, no masking.
+
+        Returns:
+            (B, Q, D) output
+        """
+        B, Q, D = q_inputs.shape
+        KV = kv_inputs.shape[1]
+        head_dim = D // self.num_heads
+
+        # Pre-norm
+        q = nn.LayerNorm(epsilon=self.layer_norm_eps)(q_inputs)
+        kv = nn.LayerNorm(epsilon=self.layer_norm_eps)(kv_inputs)
+
+        # Project Q from queries, K and V from kv_inputs
+        q_proj = nn.Dense(D, name='q_proj')(q)
+        k_proj = nn.Dense(D, name='k_proj')(kv)
+        v_proj = nn.Dense(D, name='v_proj')(kv)
+
+        # Reshape for multi-head
+        q_proj = q_proj.reshape(B, Q, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        k_proj = k_proj.reshape(B, KV, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        v_proj = v_proj.reshape(B, KV, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+
+        # Attention scores: (B, heads, Q, KV)
+        scale = head_dim ** -0.5
+        scores = jnp.einsum('bhid,bhjd->bhij', q_proj, k_proj) * scale
+
+        # Apply KV mask if provided
+        if kv_mask is not None:
+            # Ensure mask has shape (B, 1, 1, KV) for broadcasting
+            if kv_mask.ndim == 2:  # (B, KV)
+                kv_mask = kv_mask[:, None, None, :]
+            elif kv_mask.ndim == 3:  # (B, 1, KV)
+                kv_mask = kv_mask[:, :, None, :]
+            # Where mask is False, set to -inf
+            scores = jnp.where(kv_mask, scores, jnp.finfo(scores.dtype).min)
+
+        attn = jax.nn.softmax(scores, axis=-1)
+        out = jnp.einsum('bhij,bhjd->bhid', attn, v_proj)
+
+        # Reshape back
+        out = out.transpose(0, 2, 1, 3).reshape(B, Q, D)
+        out = nn.Dense(D, name='out_proj')(out)
+
+        # Residual
+        x = q_inputs + out
+
+        # MLP with pre-norm
+        y = nn.LayerNorm(epsilon=self.layer_norm_eps)(x)
+        y = MlpBlock(self.emb_dim * self.mlp_ratio, self.emb_dim)(y)
+
+        return x + y
+
+
+class FiLMConditioning(nn.Module):
+    """Feature-wise Linear Modulation for conditioning.
+
+    Applies scale (gamma) and shift (beta) to input features based on
+    conditioning vector. Used for physics conditioning in Skip-Perceiver.
+
+    Reference: Perez et al. "FiLM: Visual Reasoning with a General Conditioning Layer"
+    """
+    emb_dim: int
+
+    @nn.compact
+    def __call__(self, x, conditioning):
+        """
+        Args:
+            x: (B, T, D) input features
+            conditioning: (B, C) conditioning vector (e.g., physics params)
+
+        Returns:
+            (B, T, D) modulated features
+        """
+        # Project conditioning to scale and shift
+        gamma = nn.Dense(self.emb_dim, name='gamma')(conditioning)  # (B, D)
+        beta = nn.Dense(self.emb_dim, name='beta')(conditioning)    # (B, D)
+
+        # Center gamma around 1 (so default is identity transform)
+        gamma = 1.0 + gamma
+
+        # Apply FiLM: x' = gamma * x + beta
+        # gamma/beta are (B, D), broadcast over T dimension
+        return gamma[:, None, :] * x + beta[:, None, :]
+
+
+class ReadoutPooling(nn.Module):
+    """Pool variable-length sequence to fixed-size representation.
+
+    Uses learnable readout tokens that aggregate sequence information via
+    cross-attention. Similar to Perceiver, but applied AFTER full self-attention
+    (not before), preserving more information.
+    """
+    num_readout: int = 64
+    emb_dim: int = 128
+    num_heads: int = 8
+    depth: int = 2
+    mlp_ratio: int = 2
+    layer_norm_eps: float = 1e-5
+
+    @nn.compact
+    def __call__(self, x, mask=None):
+        """
+        Args:
+            x: (B, T, D) full sequence from encoder
+            mask: (B, T) validity mask (True=valid, False=padding)
+
+        Returns:
+            (B, num_readout, D) fixed-size representation for decoder
+        """
+        B = x.shape[0]
+
+        # Learnable readout queries
+        readout = self.param('readout',
+                            normal(stddev=0.02),
+                            (self.num_readout, self.emb_dim))
+        # Broadcast to batch
+        readout = jnp.broadcast_to(readout, (B, self.num_readout, self.emb_dim))
+        # Make it a proper array (not a broadcast view) for gradient flow
+        readout = jnp.array(readout)
+
+        # Cross-attention: readout queries, sequence is key/value
+        # This aggregates information from the full sequence into fixed tokens
+        for _ in range(self.depth):
+            readout = MaskedCrossAttnBlock(
+                num_heads=self.num_heads,
+                emb_dim=self.emb_dim,
+                mlp_ratio=self.mlp_ratio,
+                layer_norm_eps=self.layer_norm_eps
+            )(readout, x, kv_mask=mask)
+
+        # Final layer norm
+        readout = nn.LayerNorm(epsilon=self.layer_norm_eps)(readout)
+
+        return readout  # (B, num_readout, D)
+
+
 class PerceiverBlock(nn.Module):
     emb_dim: int
     depth: int

@@ -146,12 +146,18 @@ def target_loss_fn(
     t_query = batch['t_query']  # (B, N_q, 1)
     targets = batch['targets']  # (B, N_q, 2)
 
-    # Encode (with time coordinates and optional physics conditioning)
+    # Get lengths if available (for skip-perceiver masking)
+    lengths = batch.get('lengths', None)  # (B,) or None
+
+    # Build encoder kwargs
+    encoder_kwargs = {'x': cgyro, 't': time}
     if use_physics_conditioning:
-        physics_params = batch['physics_params']  # (B, num_params)
-        z = encoder.apply(encoder_params, cgyro, time, physics_params=physics_params)  # (B, num_latents+1, emb_dim)
-    else:
-        z = encoder.apply(encoder_params, cgyro, time)  # (B, num_latents, emb_dim)
+        encoder_kwargs['physics_params'] = batch['physics_params']  # (B, num_params)
+    if lengths is not None:
+        encoder_kwargs['lengths'] = lengths  # For skip-perceiver attention masking
+
+    # Encode
+    z = encoder.apply(encoder_params, **encoder_kwargs)  # (B, num_latents, emb_dim)
 
     # Decode at query times
     recon = decoder.apply(decoder_params, z, t_query)  # (B, N_q, 2)
@@ -484,12 +490,16 @@ def prepare_target_batch(
     targets = cgyro[batch_idx, nearest_indices, :]  # (B, N_q, 2)
     t_query = time[batch_idx, nearest_indices, :]   # (B, N_q, 1)
     
-    return {
+    batch = {
         'cgyro': cgyro,
         'time': time,
         't_query': t_query,
         'targets': targets,
     }
+    # Include lengths for skip-perceiver masking
+    if lengths is not None:
+        batch['lengths'] = lengths
+    return batch
 
 
 def prepare_target_batch_arbitrary_times(
